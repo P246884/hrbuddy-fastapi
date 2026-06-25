@@ -1,0 +1,1146 @@
+"""
+app/services/leave_action_executor.py
+"""
+
+import re
+import json
+from datetime import datetime, timedelta
+from dateutil import parser as dateparser
+
+from app.api_clients.hrms_api import call_hrbuddy_api
+from app.crm.entity_resolver import resolve_employee
+from app.crm.crm_query_builder import build_dynamic_query
+from app.crm.crm_executor import execute_crm_query
+from app.intent.fast_intent import clean_text, NON_NAME_QUALIFIERS, title_name
+
+
+# -------------------------------------------------------
+# WEEKEND + HOLIDAY CHECK
+# -------------------------------------------------------
+
+def _get_holidays(token, user, years=None):
+    """Fetch public holidays for the given year(s). Returns
+    (holiday_dates:set[str], years_with_data:set[int]). A year that appears in
+    `years` but returns no rows is treated as 'not configured' (caller can warn
+    and fall back to weekends-only for those dates)."""
+    holiday_dates = set()
+    years_with_data = set()
+    try:
+        if not years:
+            years = [datetime.now().year]
+        ymin, ymax = min(years), max(years)
+        query = {
+            "crm_entity": "bam_holiday",
+            "crm_filters": {"from_date": str(ymin) + "-01-01",
+                            "to_date": str(ymax) + "-12-31"},
+            "fields": {"holiday_name": "bam_name", "start_date": "bam_startdate",
+                       "end_date": "bam_enddate"}
+        }
+        result = execute_crm_query(crm_query=query, token=token, user=user)
+        if result.get("success"):
+            for h in result.get("data", []):
+                for key in ("start_date", "end_date"):
+                    ds = str(h.get(key, ""))[:10]
+                    if ds:
+                        holiday_dates.add(ds)
+                        try:
+                            years_with_data.add(int(ds[:4]))
+                        except ValueError:
+                            pass
+    except Exception as ex:
+        print("Holiday fetch error:", ex)
+    return holiday_dates, years_with_data
+
+
+def _leave_day_count(from_date, to_date, token, user):
+    """Count working leave days in [from_date, to_date]: always exclude
+    Sat/Sun; exclude public holidays for years that HAVE a configured holiday
+    list. For a year with no holidays configured (e.g. next year not added yet)
+    only weekends are removed and a note is returned so the user can verify.
+    Returns (count:int, note:str)."""
+    try:
+        fd = datetime.strptime(from_date, "%Y-%m-%d")
+        td = datetime.strptime(to_date, "%Y-%m-%d")
+    except Exception:
+        return 0, ""
+    years = list(range(fd.year, td.year + 1))
+    holiday_dates, years_with_data = _get_holidays(token, user, years)
+    uncovered = [y for y in years if y not in years_with_data]
+
+    count = 0
+    current = fd
+    while current <= td:
+        if current.weekday() < 5 and current.strftime("%Y-%m-%d") not in holiday_dates:
+            count += 1
+        current += timedelta(days=1)
+
+    note = ""
+    if uncovered:
+        yrs = ", ".join(str(y) for y in uncovered)
+        note = ("Note: public holidays for " + yrs + " aren't configured yet, "
+                "so only weekends were excluded for those dates. Please verify "
+                "if any holidays fall in this range.")
+    return count, note
+
+
+def _working_days(from_date, to_date, token, user):
+    """Working-day count only (weekends + configured holidays excluded)."""
+    count, _ = _leave_day_count(from_date, to_date, token, user)
+    return count
+
+
+def _check_date_validity(from_date, to_date, token, user):
+    """A leave range is valid as long as it contains at least one working day.
+    Weekends/holidays inside a multi-day range are simply not counted — they do
+    NOT block the request. Only a selection that is ENTIRELY weekends/holidays
+    is rejected."""
+    try:
+        fd = datetime.strptime(from_date, "%Y-%m-%d")
+        td = datetime.strptime(to_date, "%Y-%m-%d")
+    except Exception:
+        return True, ""
+    if _working_days(from_date, to_date, token, user) > 0:
+        return True, ""
+    # zero working days -> whole selection is weekend/holiday
+    if fd.date() == td.date():
+        if fd.weekday() >= 5:
+            day_name = "Saturday" if fd.weekday() == 5 else "Sunday"
+            return False, from_date + " is a " + day_name + ". You cannot apply leave on a weekend."
+        return False, from_date + " is a public holiday. You cannot apply leave on this date."
+    return False, ("The selected dates fall entirely on weekends/holidays. "
+                   "Please pick working days.")
+
+
+# -------------------------------------------------------
+# MANAGER CHECK
+# -------------------------------------------------------
+
+def _is_manager_of(emp_name, token, user):
+    """Check via permission_engine central function"""
+    if not emp_name:
+        return False
+    try:
+        from app.security.permission_engine import is_manager_of_employee
+        emp_result = resolve_employee(employee_name=emp_name, token=token, user=user)
+        if not emp_result.get("success") or not emp_result.get("data"):
+            return False
+        emp_records = emp_result.get("data", [])
+        if len(emp_records) != 1:
+            return False
+        target_guid = emp_records[0].get("employee_guid")
+        return is_manager_of_employee(user.get("user_guid", ""), target_guid, token, user)
+    except Exception as e:
+        print("Manager check error:", e)
+    return False
+
+
+# -------------------------------------------------------
+# SPECIAL RESPONSE BUILDERS
+# -------------------------------------------------------
+
+def _date_picker_response(message, context, default_from="", default_to=""):
+    return json.dumps({"type": "date_picker", "message": message,
+                       "context": context,
+                       "default_from": default_from or "",
+                       "default_to": default_to or ""})
+
+def _type_picker_response(message, options, context):
+    return json.dumps({"type": "type_picker", "message": message, "options": options, "context": context})
+
+def _reason_picker_response(message, context):
+    return json.dumps({"type": "reason_picker", "message": message, "context": context})
+
+def _leave_picker_response(message, leaves, action, context):
+    return json.dumps({"type": "leave_picker", "message": message, "leaves": leaves, "action": action, "context": context})
+
+def _success_response(message):
+    return json.dumps({"type": "success", "message": message})
+
+def _error_response(message):
+    return json.dumps({"type": "error", "message": message})
+
+def _text_response(message):
+    return json.dumps({"type": "text", "message": message})
+
+
+# -------------------------------------------------------
+# LEAVE TYPE EXTRACT
+# -------------------------------------------------------
+
+def extract_leave_type_from_message(message):
+    msg = clean_text(message)
+    for shortcut, lt in {"sl": "sick", "cl": "casual", "al": "annual"}.items():
+        if re.search(r"\b" + shortcut + r"\b", msg):
+            return lt
+    for indicator in ["bimar", "tabiyat", "unwell", "not well", "feeling sick", "medical"]:
+        if indicator in msg:
+            return "sick"
+    for lt in ["carry forward", "comp off", "compoff", "maternity", "paternity", "casual", "annual", "unpaid", "sick"]:
+        if lt in msg:
+            return lt
+    return ""
+
+
+# -------------------------------------------------------
+# DATE EXTRACT
+# -------------------------------------------------------
+
+def extract_relative_date(msg):
+    """Catch standalone relative dates like 'today', 'tomorrow',
+    'yesterday', 'day after tomorrow' (+ common Hinglish). dateutil's
+    parser cannot understand these, so we resolve them against today.
+    Returns a single-day from/to (no_of_days=1) or {} if none found."""
+    msg = msg.lower()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Longer phrases first so "day after tomorrow" wins over "tomorrow".
+    offsets = [
+        (["day after tomorrow", "day after tom",
+          "parso", "parson", "parsoon", "prso", "prson", "parsoo", "parsu"], 2),
+        (["day before yesterday"], -2),
+        (["tomorrow", "tommorow", "tommorrow", "kal", "kl"], 1),
+        (["yesterday"], -1),
+        (["today", "aaj", "aj", "ajj", "aaz"], 0),
+    ]
+
+    for phrases, delta in offsets:
+        for phrase in phrases:
+            if re.search(r"\b" + re.escape(phrase) + r"\b", msg):
+                ds = (today + timedelta(days=delta)).strftime("%Y-%m-%d")
+                return {"from_date": ds, "to_date": ds, "no_of_days": 1}
+
+    # Weekday names -> the upcoming occurrence (leave is for the future).
+    # "apply leave for monday/tuesday" resolves to that day's date.
+    weekdays = {
+        "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3, "thurs": 3,
+        "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+    }
+    for name, wd in weekdays.items():
+        if re.search(r"\b" + name + r"\b", msg):
+            days_ahead = (wd - today.weekday()) % 7  # 0 = today is that weekday
+            d = today + timedelta(days=days_ahead)
+            ds = d.strftime("%Y-%m-%d")
+            # weekday is ambiguous (this week / next) -> ask the user to confirm
+            return {"from_date": ds, "to_date": ds, "no_of_days": 1,
+                    "needs_confirm": True}
+
+    return {}
+
+
+def _natural_single_date(msg):
+    """Parse a natural single date like '22 june 2026', '22nd june',
+    'june 22 2026'. Returns single-day from/to or {}."""
+    months = ("january|february|march|april|may|june|july|august|september|"
+              "october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|"
+              "oct|nov|dec")
+    patterns = [
+        r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:" + months + r")(?:\s+\d{4})?\b",
+        r"\b(?:" + months + r")\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+\d{4})?\b",
+    ]
+    for p in patterns:
+        m = re.search(p, msg, re.IGNORECASE)
+        if m:
+            try:
+                d = dateparser.parse(
+                    m.group(0),
+                    default=datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+                )
+                if d:
+                    ds = d.strftime("%Y-%m-%d")
+                    return {"from_date": ds, "to_date": ds, "no_of_days": 1}
+            except Exception:
+                pass
+    return {}
+
+
+def extract_dates_from_message(message):
+    msg = message.lower().strip()
+    result = {}
+
+    # Explicit ranges / date-pairs take priority. Only when none of those
+    # structures are present do we treat a bare relative word as the date.
+    has_range = bool(
+        re.search(r"\bfrom\b.+\bto\b", msg)
+        or re.search(r"\bse\b.+\btak\b", msg)
+        or re.findall(r"\d{2}[/-]\d{2}[/-]\d{4}|\d{4}[/-]\d{2}[/-]\d{2}", msg)
+    )
+    if not has_range:
+        rel = extract_relative_date(msg)
+        if rel:
+            return rel
+        nat = _natural_single_date(msg)
+        if nat:
+            return nat
+
+    hinglish = re.search(r"(\d{1,2}\s+\w+)\s+se\s+(\d{1,2}\s+\w+)\s+tak", msg, re.IGNORECASE)
+    if hinglish:
+        try:
+            fd = dateparser.parse(hinglish.group(1).strip(), default=datetime.now().replace(hour=0, minute=0, second=0))
+            td = dateparser.parse(hinglish.group(2).strip(), default=datetime.now().replace(hour=0, minute=0, second=0))
+            if fd and td and fd.date() <= td.date():
+                result["from_date"] = fd.strftime("%Y-%m-%d")
+                result["to_date"] = td.strftime("%Y-%m-%d")
+                result["no_of_days"] = (td.date() - fd.date()).days + 1
+                return result
+        except Exception:
+            pass
+
+    eng = re.search(r"from\s+(.+?)\s+to\s+(.+?)(?:\s+for|\s+reason|\s+because|$)", msg, re.IGNORECASE)
+    if eng:
+        try:
+            fd = dateparser.parse(eng.group(1).strip(), default=datetime.now().replace(hour=0, minute=0, second=0))
+            td = dateparser.parse(eng.group(2).strip(), default=datetime.now().replace(hour=0, minute=0, second=0))
+            if fd and td and fd.date() <= td.date():
+                result["from_date"] = fd.strftime("%Y-%m-%d")
+                result["to_date"] = td.strftime("%Y-%m-%d")
+                result["no_of_days"] = (td.date() - fd.date()).days + 1
+                return result
+            elif fd and td and fd.date() > td.date():
+                result["date_error"] = True
+                return result
+        except Exception:
+            pass
+
+    date_pair = re.findall(r"\d{2}[/-]\d{2}[/-]\d{4}|\d{4}[/-]\d{2}[/-]\d{2}", msg)
+    if len(date_pair) >= 2:
+        try:
+            fd = dateparser.parse(date_pair[0])
+            td = dateparser.parse(date_pair[1])
+            if fd and td and fd.date() <= td.date():
+                result["from_date"] = fd.strftime("%Y-%m-%d")
+                result["to_date"] = td.strftime("%Y-%m-%d")
+                result["no_of_days"] = (td.date() - fd.date()).days + 1
+                return result
+            elif fd and td and fd.date() > td.date():
+                result["date_error"] = True
+                return result
+        except Exception:
+            pass
+
+    on_match = re.search(r"\bon\s+(.+?)(?:\s+for|\s+reason|$)", msg)
+    if on_match:
+        try:
+            single = dateparser.parse(on_match.group(1).strip(), default=datetime.now().replace(hour=0, minute=0, second=0))
+            if single:
+                result["from_date"] = single.strftime("%Y-%m-%d")
+                result["to_date"] = single.strftime("%Y-%m-%d")
+                result["no_of_days"] = 1
+                return result
+        except Exception:
+            pass
+
+    return result
+
+
+def extract_half_day_type(message):
+    msg = message.lower()
+    if "first half" in msg: return "first"
+    if "second half" in msg: return "second"
+    return None
+
+
+def extract_reason_from_message(message):
+    match = re.search(r"(?:reason|because|due to)\s+(.+?)(?:\s+from|\s+on|$)", message, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    msg = clean_text(message)
+    action_words = {"apply", "approve", "reject", "cancel", "leave", "sick",
+                    "annual", "casual", "from", "to", "for", "harshal", "purav"}
+    words = msg.split()
+    if len(words) <= 5 and not any(w in action_words for w in words):
+        return message.strip()
+    return ""
+
+
+# -------------------------------------------------------
+# EMPLOYEE NAME EXTRACT
+# -------------------------------------------------------
+
+def extract_employee_code_for_action(message):
+    """Pull an employee code out of the message when the user disambiguates,
+    e.g. 'employee code 1215', 'code IN10', 'emp no 0881', '(1216)'.
+    Codes are alphanumeric (digits, or letters+digits like IN10)."""
+    if not message:
+        return ""
+    msg = str(message)
+    # "employee code 1215", "emp code IN10", "code: 0881", "employee no 1215"
+    m = re.search(
+        r"(?:employee\s+code|emp\s+code|employee\s+no\.?|emp\s+no\.?|code|id)\s*[:#]?\s*([A-Za-z]{0,3}\d{2,6})",
+        msg, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip()
+    # bare "(1215)" style in parentheses
+    m = re.search(r"\(([A-Za-z]{0,3}\d{2,6})\)", msg)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def narrow_employee_records(records, message):
+    """Given multiple matched employees, narrow them using ANY distinguishing
+    info present in the message — not just code. Tries, in order:
+      1. employee code   (exact)
+      2. full name       (the message contains the whole name, e.g. "harshal patel")
+      3. department      (message mentions the record's department)
+      4. designation     (message mentions the record's designation)
+    Returns the narrowed list (length 1 if it could disambiguate, else the
+    original list unchanged)."""
+    if not records or len(records) == 1:
+        return records
+
+    msg = clean_text(message)
+    code = extract_employee_code_for_action(message)
+
+    def _contains_phrase(haystack, phrase):
+        # Whole-word/phrase match so "harsh" doesn't match inside "harshal".
+        if not phrase:
+            return False
+        return re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", haystack) is not None
+
+    # Apply each available clue as a successive filter (AND). Each clue only
+    # narrows when it actually distinguishes; a clue that matches everything or
+    # nothing is skipped so it can't wrongly empty or collapse the list.
+    def _apply(filterer):
+        nonlocal records
+        if len(records) <= 1:
+            return
+        sub = [e for e in records if filterer(e)]
+        if 1 <= len(sub) < len(records):
+            records = sub
+
+    # 1) Code (most reliable) — exact match wins outright.
+    if code:
+        exact = [e for e in records if str(e.get("employee_code", "")).lower() == code.lower()]
+        if exact:
+            return exact[:1]
+
+    # 2) Department, 3) Designation — narrow first (more specific than a name
+    # prefix the user typed), then 4) name tokens as a final tiebreaker.
+    _apply(lambda e: _contains_phrase(msg, clean_text(str(e.get("department", "")))))
+    _apply(lambda e: _contains_phrase(msg, clean_text(str(e.get("designation", "")))))
+
+    # 4) Name: match on any whole word of the record's name (so "harshit"
+    # matches "HARSHIT SHARMA"). Only narrows when it singles out one record —
+    # a bare ambiguous prefix like "harsh" that hits several stays ambiguous.
+    def _name_hit(e):
+        for tok in clean_text(str(e.get("employee_name", ""))).split():
+            if len(tok) > 1 and _contains_phrase(msg, tok):
+                return True
+        return False
+    _apply(_name_hit)
+
+    return records
+
+
+def extract_employee_name_for_action(message):
+    msg = clean_text(message)
+    skip = {
+        "sick", "annual", "casual", "leave", "comp", "carry",
+        # relative-date words (must never be read as a person's name)
+        "today", "tomorrow", "yesterday",
+        "parso", "parson", "parsoon", "prso", "prson", "parsoo", "parsu",
+        "kal", "kl", "aaj", "aj", "ajj", "aaz", "narso",
+        # weekday names (+ abbreviations) — "for wednesday" is a date, not a name
+        "monday", "mon", "tuesday", "tue", "tues", "wednesday", "wed",
+        "thursday", "thu", "thurs", "friday", "fri", "saturday", "sat",
+        "sunday", "sun",
+        # self pronouns (English + Hinglish)
+        "me", "my", "i", "mere", "meri", "mera", "mujhe",
+        "apni", "apna", "khud", "self",
+        # third-person pronouns — "for him/her/them" is NOT a name
+        "him", "her", "them", "his", "their", "he", "she", "they", "it",
+        # common sentence filler that is never a name
+        "city", "out", "office", "work", "home", "town", "station",
+        "please", "kindly", "so", "as", "was", "were", "is", "am", "are",
+        "the", "a", "an", "and", "because", "since", "today",
+    }
+
+    def _clean_name(name):
+        """Drop relative/self/stop words from a captured name.
+        'purav tomorrow' -> 'purav'; 'mere parso' -> '' (self);
+        'him' -> '' (pronoun, not a name)."""
+        toks = [w for w in name.split() if w not in skip and w not in NON_NAME_QUALIFIERS]
+        return " ".join(toks).strip()
+
+    # 1) "for <name>" — but if it resolves to a pronoun/filler (e.g. "for him"),
+    #    fall through so we can find the real subject name below.
+    match = re.search(r"\bfor\s+([a-z]+(?:\s+[a-z]+)?)(?:\s+from|\s+on|\s+sick|\s+annual|\s+casual|\s+leave|$)", msg)
+    if match:
+        name = _clean_name(match.group(1).strip())
+        if name:
+            return name.title()
+
+    # 2) "<name> ki leave"
+    match2 = re.search(r"([a-z]+(?:\s+[a-z]+)?)\s+ki\s+leave", msg)
+    if match2:
+        name = _clean_name(match2.group(1).strip())
+        if name:
+            return name.title()
+
+    # 3) possessive "<name>'s leave"
+    match3 = re.search(r"([a-zA-Z]+)'s\s+leave", message, re.IGNORECASE)
+    if match3:
+        name = _clean_name(clean_text(match3.group(1)))
+        if name:
+            return name.title()
+
+    # 4) "of <name>" at end
+    match4 = re.search(r"\bof\s+([a-zA-Z]+)(?:'s)?\s*$", message, re.IGNORECASE)
+    if match4:
+        name = _clean_name(clean_text(match4.group(1)))
+        if name:
+            return name.title()
+
+    # 4b) "<verb> <name> leave(s)" — name sits directly before the leave noun,
+    #     e.g. "approve harsh leave", "reject harshal leaves", "cancel purav
+    #     leave". Skip articles/pronouns ("approve a leave", "approve my leave").
+    match4b = re.search(
+        r"\b(?:approve|reject|decline|deny|cancel|withdraw|grant|apply)\s+"
+        r"([a-z]+(?:\s+[a-z]+)?)\s+(?:leave|leaves|chutti|chhutti)\b",
+        msg
+    )
+    if match4b:
+        name = _clean_name(match4b.group(1).strip())
+        if name:
+            return name.title()
+
+    # 4c) "<verb> <name> ..." — name is the first meaningful word right after an
+    #     action verb, even when a clue follows ("approve harsh with code 1215
+    #     leave", "reject harsh from sales"). Stops at code/clue/filler words.
+    match4c = re.search(
+        r"\b(?:approve|reject|decline|deny|cancel|withdraw|grant|apply)\s+([a-z]+)",
+        msg
+    )
+    if match4c:
+        cand = match4c.group(1).strip()
+        _STOP4C = {"a", "an", "the", "my", "his", "her", "their", "leave",
+                   "leaves", "chutti", "chhutti", "with", "code", "for", "of",
+                   # Hinglish apply-verb fragments — never a name
+                   "krdo", "kardo", "kar", "krni", "karni", "krna", "karna",
+                   "kr", "lagao", "lgao", "laga", "lga", "chahiye", "chaiye",
+                   "do", "dedo", "kardena", "krdena"}
+        if cand not in _STOP4C and cand not in skip and len(cand) > 1:
+            return cand.title()
+
+    # 5) Subject-name fallback for natural sentences with a 3rd-person pronoun,
+    #    e.g. "as harshal was out of city yesterday please apply leave for him".
+    #    The real name is the first meaningful (non-skip) token in the message.
+    if re.search(r"\b(him|her|them|his|their|he|she|they)\b", msg):
+        for tok in msg.split():
+            if tok in skip:
+                continue
+            if tok.isdigit() or len(tok) < 2:
+                continue
+            # ignore obvious command verbs
+            if tok in ("apply", "applying", "grant", "approve", "reject",
+                       "cancel", "show", "get", "fetch", "give"):
+                continue
+            return tok.title()
+
+    return ""
+
+
+# -------------------------------------------------------
+# LEAVE BALANCE FETCH
+# -------------------------------------------------------
+
+def get_employee_leave_balances(employee_guid, token, user):
+    query = build_dynamic_query(
+        entity_name="leave",
+        filters={"target": "employee", "employee_guid": employee_guid},
+        current_user=user
+    )
+    result = execute_crm_query(crm_query=query, token=token, user=user)
+    if not result.get("success"):
+        return []
+    return result.get("data", [])
+
+
+def resolve_leave_type(leave_type_name, employee_guid, token, user):
+    if not leave_type_name:
+        return None
+    records = get_employee_leave_balances(employee_guid, token, user)
+    name_clean = clean_text(leave_type_name)
+    print("LEAVE RECORDS:", records)
+    print("LOOKING FOR:", name_clean)
+    for record in records:
+        lt = clean_text(str(record.get("leave_type", "")))
+        if name_clean in lt or lt in name_clean:
+            return {
+                "leave_type_name": record.get("leave_type"),
+                "balance": float(record.get("balance") or 0),
+                "leave_type_guid": str(record.get("leave_type_guid") or ""),
+                "leave_structure_guid": str(record.get("leave_structure_guid") or ""),
+            }
+    return None
+
+
+# -------------------------------------------------------
+# APPLY LEAVE
+# -------------------------------------------------------
+
+def handle_apply_leave(message, user, token, pending_context=None):
+    context = pending_context or {}
+
+    leave_type_name = context.get("leave_type_name") or extract_leave_type_from_message(message)
+    dates = extract_dates_from_message(message)
+
+    if dates.get("date_error"):
+        return _error_response("Start date cannot be after end date. Please select correct dates."), None
+
+    from_date = context.get("from_date") or dates.get("from_date")
+    to_date = context.get("to_date") or dates.get("to_date")
+
+    if context.get("no_of_days"):
+        no_of_days = context.get("no_of_days")
+    else:
+        no_of_days = dates.get("no_of_days", 0)
+
+    reason = context.get("reason") or extract_reason_from_message(message)
+    employee_guid = context.get("employee_guid", "")
+    employee_display_name = context.get("employee_display_name", "")
+    is_hr = user.get("is_hr") or user.get("is_admin")
+
+    if not employee_guid:
+        emp_name_from_msg = extract_employee_name_for_action(message)
+        emp_code_from_msg = extract_employee_code_for_action(message)
+
+        if emp_name_from_msg and not is_hr and not _is_manager_of(emp_name_from_msg, token, user):
+            return _error_response("You are not authorized to apply leave for other employees."), None
+
+        if (emp_name_from_msg or emp_code_from_msg) and (is_hr or _is_manager_of(emp_name_from_msg, token, user)):
+            emp_result = resolve_employee(
+                employee_name=emp_name_from_msg, token=token, user=user,
+                employee_code=emp_code_from_msg
+            )
+            if not emp_result.get("success"):
+                return _error_response("Could not find employee '" + (emp_code_from_msg or emp_name_from_msg) + "'."), None
+            emp_records = emp_result.get("data", [])
+            if not emp_records:
+                return _error_response("No employee found matching '" + (emp_code_from_msg or emp_name_from_msg) + "'."), None
+            # Narrow a multi-match list by ANY distinguishing info in the message:
+            # employee code, full name, department, or designation.
+            if len(emp_records) > 1:
+                emp_records = narrow_employee_records(emp_records, message)
+            if len(emp_records) > 1:
+                lines = "Multiple employees found:\n"
+                for i, e in enumerate(emp_records, 1):
+                    parts = [str(e.get("employee_name"))]
+                    if e.get("employee_code"):
+                        parts.append(str(e.get("employee_code")))
+                    if e.get("department"):
+                        parts.append(str(e.get("department")))
+                    if e.get("designation"):
+                        parts.append(str(e.get("designation")))
+                    lines += str(i) + ". " + " | ".join(parts) + "\n"
+                lines += ("\nPlease narrow it down — add the full name, employee "
+                          "code, department, or designation. For example: "
+                          "\"apply leave for " + str(emp_records[0].get("employee_code")) + "\".")
+                return _text_response(lines), None
+            employee_guid = emp_records[0].get("employee_guid")
+            employee_display_name = emp_records[0].get("employee_name")
+        else:
+            employee_guid = user.get("user_guid", "")
+            employee_display_name = user.get("name", "You")
+
+    leave_options = []
+    if employee_guid:
+        records = get_employee_leave_balances(employee_guid, token, user)
+        leave_options = [
+            r.get("leave_type") + " (" + str(r.get("balance", 0)) + " days)"
+            for r in records
+            if r.get("leave_type") and float(r.get("balance") or 0) > 0
+        ]
+
+    # Weekday-resolved date -> confirm with a PRE-FILLED date picker. The user
+    # said e.g. "monday"; we show the actual resolved date so they confirm or
+    # adjust (this/next week is ambiguous). Explicit dates ("22 june 2026") and
+    # today/tomorrow skip this — they are unambiguous. Fires only on the first
+    # turn; once the picker is submitted the date lives in context.
+    if dates.get("needs_confirm") and not context.get("from_date"):
+        new_ctx = {**context, "action": "apply_leave",
+                   "leave_type_name": leave_type_name,
+                   "employee_guid": employee_guid,
+                   "employee_display_name": employee_display_name}
+        return _date_picker_response(
+            message=("Please confirm the date for " + employee_display_name
+                     + " (we read it as " + str(from_date) + "). "
+                     "Change it below if needed:"),
+            context=new_ctx,
+            default_from=from_date,
+            default_to=to_date or from_date,
+        ), new_ctx
+
+    if not leave_type_name and not from_date:
+        new_ctx = {**context, "action": "apply_leave", "employee_guid": employee_guid, "employee_display_name": employee_display_name}
+        if not leave_options:
+            return _error_response("No leave types found for " + employee_display_name + "."), None
+        return _type_picker_response(
+            message="Select leave type for " + employee_display_name + ":",
+            options=leave_options,
+            context={**new_ctx, "next_step": "date_picker"}
+        ), new_ctx
+
+    if not leave_type_name:
+        new_ctx = {**context, "action": "apply_leave", "from_date": from_date, "to_date": to_date, "no_of_days": no_of_days, "employee_guid": employee_guid, "employee_display_name": employee_display_name}
+        if not leave_options:
+            return _error_response("No leave types found for " + employee_display_name + "."), None
+        return _type_picker_response(
+            message="Select leave type for " + employee_display_name + ":",
+            options=leave_options,
+            context=new_ctx
+        ), new_ctx
+
+    if not from_date or not to_date:
+        new_ctx = {**context, "action": "apply_leave", "leave_type_name": leave_type_name, "from_date": from_date, "to_date": to_date, "employee_guid": employee_guid, "employee_display_name": employee_display_name}
+        return _date_picker_response(
+            message="Select dates for " + employee_display_name + "'s " + leave_type_name + " leave:",
+            context=new_ctx
+        ), new_ctx
+
+    if not reason and not context.get("reason_asked"):
+        new_ctx = {
+            **context,
+            "action": "apply_leave",
+            "leave_type_name": leave_type_name,
+            "from_date": from_date,
+            "to_date": to_date,
+            "no_of_days": no_of_days,
+            "employee_guid": employee_guid,
+            "employee_display_name": employee_display_name,
+            "reason_asked": True
+        }
+        return _reason_picker_response(
+            message="Please provide a reason for " + employee_display_name + "'s " + leave_type_name + " leave (" + str(from_date) + " to " + str(to_date) + "):",
+            context=new_ctx
+        ), new_ctx
+
+    leave_info = resolve_leave_type(leave_type_name=leave_type_name, employee_guid=employee_guid, token=token, user=user)
+
+    if not leave_info:
+        clean_ctx = {
+            "action": "apply_leave",
+            "from_date": from_date,
+            "to_date": to_date,
+            "no_of_days": no_of_days,
+            "reason": reason,
+            "reason_asked": context.get("reason_asked", False),
+            "employee_guid": employee_guid,
+            "employee_display_name": employee_display_name
+        }
+        return _type_picker_response(
+            message="Please select a valid leave type for " + employee_display_name + ":",
+            options=leave_options or ["Sick Leave", "Annual Leave", "Casual Leave"],
+            context=clean_ctx
+        ), clean_ctx
+
+    balance = leave_info.get("balance", 0)
+    requested = float(no_of_days or 1)
+    holiday_note = ""
+
+    # For a multi-day range, count only WORKING days (exclude weekends +
+    # holidays) so the balance check and the stored day-count are accurate.
+    # Single-day / half-day requests keep their value (handles 0.5 etc.).
+    if from_date and to_date and from_date != to_date:
+        wd, holiday_note = _leave_day_count(from_date, to_date, token, user)
+        if wd > 0:
+            requested = float(wd)
+            no_of_days = wd
+
+    if balance < requested:
+        return _error_response(
+            "Insufficient " + leave_info["leave_type_name"] + " balance for " + employee_display_name + ".\n"
+            "Available: " + str(balance) + " days | Requested: " + str(requested) + " working day(s)."
+        ), None
+
+    # Weekend + Holiday check
+    is_valid, date_error_msg = _check_date_validity(from_date, to_date, token, user)
+    if not is_valid:
+        return _error_response("\u274c " + date_error_msg), None
+
+    # Half day info
+    half_day_info = context.get("half_day_info") or ""
+    full_reason = reason or ""
+    beginning_from = "full"
+    ending_in = "full"
+    if half_day_info:
+        parts_info = []
+        if "start:second" in half_day_info:
+            parts_info.append("Start: Second Half")
+            beginning_from = "half"
+        if "end:first" in half_day_info:
+            parts_info.append("End: First Half")
+            ending_in = "half"
+        half_label = " | ".join(parts_info)
+        if full_reason:
+            full_reason = half_label + " - " + full_reason
+        else:
+            full_reason = half_label
+
+    response = call_hrbuddy_api(
+        endpoint="/api/hrbuddy/execute-action",
+        token=token, user=user, method="POST",
+        body={
+            "action": "apply_leave",
+            "payload": {
+                "employee_guid": employee_guid,
+                "leave_type_guid": leave_info.get("leave_type_guid", ""),
+                "leave_structure_guid": leave_info.get("leave_structure_guid", ""),
+                "from_date": from_date,
+                "to_date": to_date,
+                "no_of_days": requested,
+                "reason": full_reason,
+                "beginning_from": beginning_from,
+                "ending_in": ending_in
+            }
+        }
+    )
+
+    if not response.get("success"):
+        return _error_response(response.get("message", "Failed to apply leave.")), None
+
+    remaining = balance - requested
+    return _success_response(
+        "\u2705 " + leave_info["leave_type_name"] + " applied for " + employee_display_name + "\n"
+        "\U0001f4c5 " + str(from_date) + " \u2192 " + str(to_date) + " (" + str(requested) + " day(s))\n"
+        "\U0001f4dd Reason: " + str(reason or "N/A") + "\n"
+        "\U0001f4ca Remaining balance: " + str(remaining) + " days"
+        + (("\n\u26a0\ufe0f " + holiday_note) if holiday_note else "")
+    ), None
+
+
+# -------------------------------------------------------
+# FETCH RECENT LEAVES
+# -------------------------------------------------------
+
+def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter="requested"):
+    emp_name = extract_employee_name_for_action(message)
+    emp_code = extract_employee_code_for_action(message)
+
+    if not emp_name and not emp_code:
+        employee_guid = user.get("user_guid")
+        employee_name = user.get("name", "You")
+    else:
+        emp_result = resolve_employee(
+            employee_name=emp_name, token=token, user=user, employee_code=emp_code
+        )
+        if not emp_result.get("success") or not emp_result.get("data"):
+            return _error_response("No employee found matching '" + (emp_code or emp_name) + "'."), None
+        emp_records = emp_result.get("data", [])
+        # Narrow a multi-match list by ANY clue in the message (code, full name,
+        # department, designation) — same as the apply flow.
+        if len(emp_records) > 1:
+            emp_records = narrow_employee_records(emp_records, message)
+        if len(emp_records) > 1:
+            lines = "Multiple employees found:\n"
+            for i, e in enumerate(emp_records, 1):
+                parts = [str(e.get("employee_name"))]
+                if e.get("employee_code"):
+                    parts.append(str(e.get("employee_code")))
+                if e.get("department"):
+                    parts.append(str(e.get("department")))
+                if e.get("designation"):
+                    parts.append(str(e.get("designation")))
+                lines += str(i) + ". " + " | ".join(parts) + "\n"
+            lines += ("\nPlease narrow it down — add the full name, employee "
+                      "code, department, or designation.")
+            return _text_response(lines), None
+        employee_guid = emp_records[0].get("employee_guid")
+        employee_name = emp_records[0].get("employee_name")
+
+    query = build_dynamic_query(
+        entity_name="leave_history",
+        filters={"target": "employee", "employee_guid": employee_guid, "status": status_filter, "top": "4"},
+        current_user=user
+    )
+    result = execute_crm_query(crm_query=query, token=token, user=user)
+
+    if not result.get("success") or not result.get("data"):
+        return _error_response("No pending leave requests found for " + str(employee_name) + "."), None
+
+    leaves = result["data"]
+    leave_options = []
+    for leave in leaves:
+        lt = leave.get("leave_type", "Leave")
+        fd = str(leave.get("from_date", ""))[:10]
+        td = str(leave.get("to_date", ""))[:10]
+        days = leave.get("days", "")
+        leave_guid = leave.get("leave_guid", "")
+        leave_options.append({
+            "label": str(lt) + " | " + str(fd) + " \u2192 " + str(td) + " (" + str(days) + " days)",
+            "leave_guid": leave_guid
+        })
+
+    action_label = "Reject" if action == "reject_leave" else "Approve" if action == "approve_leave" else "Cancel"
+    return _leave_picker_response(
+        message="Select leave to " + action_label.lower() + " for " + str(employee_name) + ":",
+        leaves=leave_options,
+        action=action,
+        context={}
+    ), None
+
+
+# -------------------------------------------------------
+# EXECUTE ACTION BY GUID
+# -------------------------------------------------------
+
+def _execute_leave_action_by_guid(action, leave_guid, message, user, token):
+    if action == "approve_leave":
+        response = call_hrbuddy_api(
+            endpoint="/api/hrbuddy/execute-action",
+            token=token, user=user, method="POST",
+            body={"action": "approve_leave", "payload": {"leave_guid": leave_guid}}
+        )
+        if not response.get("success"):
+            return _error_response(response.get("message", "Failed to approve.")), None
+        return _success_response("\u2705 Leave approved successfully."), None
+
+    elif action == "reject_leave":
+        response = call_hrbuddy_api(
+            endpoint="/api/hrbuddy/execute-action",
+            token=token, user=user, method="POST",
+            body={"action": "reject_leave", "payload": {"leave_guid": leave_guid, "reason": extract_reason_from_message(message)}}
+        )
+        if not response.get("success"):
+            return _error_response(response.get("message", "Failed to reject.")), None
+        return _success_response("\u274c Leave rejected and balance restored."), None
+
+    elif action == "cancel_leave":
+        response = call_hrbuddy_api(
+            endpoint="/api/hrbuddy/execute-action",
+            token=token, user=user, method="POST",
+            body={"action": "cancel_leave", "payload": {"leave_guid": leave_guid}}
+        )
+        if not response.get("success"):
+            return _error_response(response.get("message", "Failed to cancel.")), None
+        return _success_response("\u2705 Leave cancelled and balance restored."), None
+
+    return _error_response("Unknown action."), None
+
+
+# -------------------------------------------------------
+# HANDLERS
+# -------------------------------------------------------
+
+def handle_approve_leave(message, user, token):
+    leave_guid = _extract_leave_guid(message)
+    # GUID directly hai — user ne leave picker se select kiya
+    # Auth already check ho chuka tha leave picker dikhane se pehle
+    if leave_guid:
+        return _execute_leave_action_by_guid("approve_leave", leave_guid, message, user, token)
+
+    # No GUID — check auth then show picker
+    is_hr_admin = user.get("is_hr") or user.get("is_admin")
+    emp_name = extract_employee_name_for_action(message)
+    if not is_hr_admin and not _is_manager_of(emp_name, token, user):
+        return _error_response("You are not authorized to approve leaves."), None
+    return _fetch_recent_leaves_of_employee(message=message, token=token, user=user, action="approve_leave")
+
+
+def handle_reject_leave(message, user, token):
+    leave_guid = _extract_leave_guid(message)
+    if leave_guid:
+        return _execute_leave_action_by_guid("reject_leave", leave_guid, message, user, token)
+
+    is_hr_admin = user.get("is_hr") or user.get("is_admin")
+    emp_name = extract_employee_name_for_action(message)
+    if not is_hr_admin and not _is_manager_of(emp_name, token, user):
+        return _error_response("You are not authorized to reject leaves."), None
+    return _fetch_recent_leaves_of_employee(message=message, token=token, user=user, action="reject_leave")
+
+
+def handle_cancel_leave(message, user, token):
+    leave_guid = _extract_leave_guid(message)
+    if leave_guid:
+        return _execute_leave_action_by_guid("cancel_leave", leave_guid, message, user, token)
+    return _fetch_recent_leaves_of_employee(message=message, token=token, user=user, action="cancel_leave", status_filter="requested")
+
+
+def _extract_leave_guid(message):
+    match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", message, re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+# -------------------------------------------------------
+# BULK / MULTI-PERSON ACTIONS
+# "Approve vikrant, reject purav's, cancel harshal leaves",
+# "approve harshal and tanish leaves", "approve harshal and reject purav", ...
+# -------------------------------------------------------
+
+_BULK_ACTION_WORDS = {
+    "approve": "approve_leave", "approved": "approve_leave",
+    "aprove": "approve_leave", "apprve": "approve_leave", "aprrove": "approve_leave",
+    "accept": "approve_leave", "accpt": "approve_leave", "ok": "approve_leave",
+    "reject": "reject_leave", "rejected": "reject_leave", "rejct": "reject_leave",
+    "rejekt": "reject_leave", "decline": "reject_leave", "deny": "reject_leave",
+    "cancel": "cancel_leave", "cancelled": "cancel_leave", "canceled": "cancel_leave",
+    "cancl": "cancel_leave", "cancle": "cancel_leave",
+}
+# words that are never a person's name inside an action chunk
+_BULK_SKIP = {
+    "leave", "leaves", "leav", "leaves", "pending", "requested", "request",
+    "the", "their", "his", "her", "its", "of", "for", "to", "please", "plz",
+    "kindly", "all", "both", "last", "latest", "recent", "this", "that",
+    "pls", "ki", "ka", "ke", "wali", "wala", "vala", "krdo", "kardo", "kr",
+    "do", "the",
+}
+
+
+def parse_bulk_actions(message):
+    """Parse a free-form message into a list of action items:
+    [{action, name, scope}]. Returns None when the message is NOT a bulk/multi
+    or auto (last) action — so the normal single-action flow handles it.
+
+    Examples that DO parse:
+      "Approve vikrant, reject purav's, cancel harshal"  (3 items)
+      "approve harshal and tanish leaves"                (2 items, same action)
+      "approve harshal and reject purav leaves"          (2 items, 2 actions)
+      "approve harshal leaves"                           (plural -> all)
+      "approve last leave of harshal"                    (scope=last)
+    Examples that DON'T (return None -> single flow):
+      "approve harshal leave"   (singular, one person, no 'last')
+      "do not approve harshal"  (negation)
+    """
+    raw = (message or "").lower()
+    if re.search(r"\b(do not|don'?\s?t|do no|donot|never|mat|nahi)\b", raw):
+        return None
+
+    # normalise: drop possessives, turn conjunctions/separators into commas
+    text = raw.replace("\u2019s", " ").replace("'s", " ")
+    text = re.sub(r"\b(and|or|also|then|plus|aur|ya)\b", ",", text)
+    text = text.replace("&", ",").replace("/", ",").replace(";", ",")
+    chunks = [c.strip() for c in text.split(",") if c.strip()]
+
+    items = []
+    last_action = None
+    for chunk in chunks:
+        ctoks = re.findall(r"[a-z]+", chunk)
+        action = None
+        name_toks = []
+        for t in ctoks:
+            if t in _BULK_ACTION_WORDS:
+                action = _BULK_ACTION_WORDS[t]
+                continue
+            if t in _BULK_SKIP or t in NON_NAME_QUALIFIERS:
+                continue
+            if len(t) >= 2:
+                name_toks.append(t)
+        if action:
+            last_action = action
+        use_action = action or last_action
+        # only approve/reject/cancel are bulk-able (apply needs dates)
+        if use_action and use_action != "apply_leave" and name_toks:
+            items.append({"action": use_action, "name": " ".join(name_toks)})
+
+    if not items:
+        return None
+
+    has_last = bool(re.search(r"\blast\b|\blatest\b", raw))
+    has_plural = bool(re.search(r"\bleaves\b", raw))
+    is_bulk = len(items) > 1 or has_plural or has_last
+    if not is_bulk:
+        return None
+
+    scope = "last" if has_last else "all"
+    for it in items:
+        it["scope"] = scope
+    return items
+
+
+def _requested_leaves_for(employee_guid, token, user, top="50"):
+    """Return the list of REQUESTED (pending) leave records for an employee,
+    most-recent first (backend orders by date desc)."""
+    query = build_dynamic_query(
+        entity_name="leave_history",
+        filters={"target": "employee", "employee_guid": employee_guid,
+                 "status": "requested", "top": top},
+        current_user=user,
+    )
+    result = execute_crm_query(crm_query=query, token=token, user=user)
+    if result.get("success"):
+        return result.get("data", []) or []
+    return []
+
+
+def handle_bulk_action(items, message, user, token):
+    """Execute parsed bulk action items and return one combined summary.
+    No pickers — each named person's requested leaves are acted on directly
+    (all of them, or just the most recent when scope == 'last')."""
+    is_hr_admin = bool(user.get("is_hr") or user.get("is_admin"))
+    verb_map = {"approve_leave": "Approved", "reject_leave": "Rejected",
+                "cancel_leave": "Cancelled"}
+    lines = []
+    any_done = 0
+
+    for it in items:
+        action = it["action"]
+        name = it["name"]
+        scope = it.get("scope", "all")
+        disp = title_name(name)
+        verb = verb_map.get(action, "Processed")
+
+        # permission: approve/reject/cancel of someone ELSE need HR/admin or
+        # being that person's manager.
+        if action in ("approve_leave", "reject_leave", "cancel_leave") and not is_hr_admin \
+                and not _is_manager_of(name, token, user):
+            lines.append("\u26a0\ufe0f " + disp + ": you are not authorized to "
+                         + action.split("_")[0] + " their leave.")
+            continue
+
+        emp = resolve_employee(employee_name=name, token=token, user=user)
+        recs = emp.get("data", []) if emp.get("success") else []
+        if len(recs) > 1:
+            recs = narrow_employee_records(recs, message)
+        if not recs:
+            lines.append("\u26a0\ufe0f " + disp + ": no matching employee found.")
+            continue
+        if len(recs) > 1:
+            lines.append("\u26a0\ufe0f " + disp + ": multiple employees match — "
+                         "please use the full name or employee code.")
+            continue
+
+        emp_guid = recs[0].get("employee_guid")
+        emp_disp = recs[0].get("employee_name") or disp
+        leaves = _requested_leaves_for(emp_guid, token, user)
+        if not leaves:
+            lines.append("\u2022 " + emp_disp + ": no pending (requested) leaves.")
+            continue
+
+        targets = leaves[:1] if scope == "last" else leaves
+        ok = 0
+        for lv in targets:
+            lg = lv.get("leave_guid", "")
+            if not lg:
+                continue
+            resp, _ = _execute_leave_action_by_guid(action, lg, message, user, token)
+            try:
+                if json.loads(resp).get("type") == "success":
+                    ok += 1
+            except Exception:
+                pass
+        any_done += ok
+        if ok:
+            suffix = " (latest)" if scope == "last" else ""
+            lines.append("\u2705 " + verb + " " + str(ok) + " leave(s) for "
+                         + emp_disp + suffix + ".")
+        else:
+            lines.append("\u26a0\ufe0f " + emp_disp + ": could not "
+                         + action.split("_")[0] + " (already processed or not allowed).")
+
+    header = ("Done \u2014 here's the summary:\n" if any_done
+              else "I couldn't complete those actions:\n")
+    return _text_response(header + "\n".join(lines)), None
+
+
+def execute_leave_action(action, message, user, token, pending_context=None):
+    if action == "apply_leave":
+        return handle_apply_leave(message, user, token, pending_context)
+    elif action == "approve_leave":
+        return handle_approve_leave(message, user, token)
+    elif action == "reject_leave":
+        return handle_reject_leave(message, user, token)
+    elif action == "cancel_leave":
+        return handle_cancel_leave(message, user, token)
+    return _text_response("I could not understand what action to perform."), None

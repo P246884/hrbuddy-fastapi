@@ -1,0 +1,676 @@
+import types
+import json
+import random
+
+from app.crm.crm_query_builder import build_dynamic_query
+from app.crm.crm_executor import execute_crm_query
+from app.crm.crm_formatter import format_records
+from app.crm.entity_registry import ENTITY_REGISTRY
+from app.crm.entity_resolver import resolve_employee
+from app.intent.fast_intent import clean_text
+from app.security.permission_engine import can_read_entity
+from app.ai.response_builder import build_ai_response,build_ai_response_stream
+
+
+# ---------------------------------------------------------------------------
+# LIST PAGINATION
+# Large plain lists (leave history, employee directory) are returned as a
+# structured "list" response so the UI can show a count + the first few rows +
+# a "Show more" button (the rest are revealed client-side, no extra request).
+# Insight / count / balance / single-record answers are NOT paginated — they
+# keep their normal short streamed reply.
+# ---------------------------------------------------------------------------
+_PAGE_SIZE = 5
+_LIST_INSIGHT_WORDS = (
+    "most", "average", "avg", "trend", "how many", "how much", "kitni",
+    "kitne", "count", "total", "which month", "usage", "used the", "balance",
+)
+_LIST_MONTHS = (
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+)
+
+
+def _list_item(entity, record):
+    """A structured item for a paginated list: a primary title, an optional
+    status badge, and labelled fields — the UI renders these as a card."""
+    if entity == "employee":
+        fields = []
+        if record.get("department"):
+            fields.append(["Department", str(record.get("department"))])
+        if record.get("designation"):
+            fields.append(["Designation", str(record.get("designation"))])
+        if record.get("experience") not in (None, ""):
+            fields.append(["Experience", str(record.get("experience")) + " yrs"])
+        if record.get("employee_code"):
+            fields.append(["Code", str(record.get("employee_code"))])
+        return {
+            "primary": str(record.get("employee_name") or record.get("name") or "Employee"),
+            "badge": "",
+            "fields": fields,
+        }
+
+    if entity == "leave_history":
+        cfg = ENTITY_REGISTRY.get("leave_history", {})
+        status_map = cfg.get("status_map", {})
+        fd = str(record.get("from_date") or "")[:10]
+        td = str(record.get("to_date") or "")[:10]
+        span = fd + (" → " + td if td and td != fd else "")
+        try:
+            status_lbl = status_map.get(int(record.get("status")), str(record.get("status") or ""))
+        except (TypeError, ValueError):
+            status_lbl = str(record.get("status") or "")
+        fields = []
+        if span.strip():
+            fields.append(["Dates", span])
+        if record.get("days") not in (None, ""):
+            fields.append(["Days", str(record.get("days"))])
+        return {
+            "primary": str(record.get("leave_type") or "Leave"),
+            "badge": status_lbl,
+            "fields": fields,
+        }
+
+    # generic fallback
+    fields = [[k, str(v)] for k, v in record.items() if v not in (None, "")][:4]
+    return {"primary": fields[0][1] if fields else "Record", "badge": "", "fields": fields[1:]}
+
+
+def _page_size(total):
+    """Dynamic chunk size so the user clicks 'Show more' as little as possible:
+    <=10 -> show everything at once; otherwise ~half the list, capped at 25 so
+    very large lists come in 25-row chunks. (e.g. 22->11, 27->14, 70->25)."""
+    if total <= 10:
+        return total
+    return min((total + 1) // 2, 25)
+
+
+def _list_intro(entity, target, filters, count):
+    """A short, natural, subject-aware header line. Knows WHOSE data it is:
+    'your' for self, '<Name>'s' when HR/manager views someone else."""
+    name = (filters.get("resolved_employee_name") or "").strip()
+    name = " ".join(name.split())
+    if name.isupper():
+        name = name.title()
+
+    if entity == "leave_history":
+        if target == "self" or not name:
+            return random.choice([
+                "Here are your leave records (" + str(count) + ").",
+                "Here's your leave history — " + str(count) + " record(s).",
+                "Found " + str(count) + " leave record(s) for you.",
+            ])
+        return random.choice([
+            "Here are " + name + "'s leave records (" + str(count) + ").",
+            "Here's " + name + "'s leave history — " + str(count) + " record(s).",
+            "Found " + str(count) + " leave record(s) for " + name + ".",
+        ])
+
+    if entity == "employee":
+        dept = filters.get("department")
+        if dept:
+            d = str(dept).title()
+            return random.choice([
+                "Here are the " + str(count) + " employees in " + d + ".",
+                "Found " + str(count) + " employees in " + d + ".",
+            ])
+        return random.choice([
+            "Here are " + str(count) + " employees.",
+            "Found " + str(count) + " employees in the directory.",
+            "Showing all " + str(count) + " employees.",
+        ])
+
+    return str(count) + " records"
+
+
+def _maybe_paginate_list(decision, entity, target, records):
+    """Return a JSON 'list' response string for a list read, else None."""
+    if not records:
+        return None
+    msg = (decision.get("original_message", "") or "").lower()
+    is_employee_list = (entity == "employee" and target == "multiple")
+    is_history_list = (entity == "leave_history")
+    if not (is_employee_list or is_history_list):
+        return None
+    # insight / count / month / balance queries keep their short answer
+    if any(w in msg for w in _LIST_INSIGHT_WORDS) or any(m in msg for m in _LIST_MONTHS):
+        return None
+
+    filters = decision.get("filters", {}) or {}
+    intro = _list_intro(entity, target, filters, len(records))
+    items = [_list_item(entity, r) for r in records]
+    return json.dumps({
+        "type": "list",
+        "kind": entity,
+        "intro": intro,
+        "count": len(records),
+        "page_size": _page_size(len(records)),
+        "items": items,
+    })
+def _is_hr_or_admin(user: dict) -> bool:
+    return bool(user.get("is_hr")) or bool(user.get("is_admin"))
+
+
+def _resolve_lookup_guid(entity_name, search_name, name_field, token, user):
+    """Lookup entity se naam ka GUID fetch karo. Exact (case-insensitive)
+    name match ko prefer karta hai, warna pehla result."""
+    if not search_name or str(search_name).strip() == "":
+        return ""
+    try:
+        from app.api_clients.hrms_api import call_hrbuddy_api
+        result = call_hrbuddy_api(
+            endpoint="/api/hrbuddy/dynamic-query",
+            token=token, user=user, method="POST",
+            body={
+                "crm_entity": entity_name,
+                "crm_filters": {name_field + "_contains": search_name},
+                "fields": {"guid": entity_name + "id", "name": name_field}
+            }
+        )
+        if result.get("success") and result.get("data"):
+            rows = result["data"]
+            target = clean_text(search_name)
+            for row in rows:
+                if clean_text(str(row.get("name", ""))) == target:
+                    return row.get("guid", "")
+            return rows[0].get("guid", "")
+    except Exception as e:
+        print("Lookup resolve error:", e)
+    return ""
+
+
+def _same_person_name(employee_name: str, user: dict) -> bool:
+    if not employee_name:
+        return False
+
+    return clean_text(employee_name) in clean_text(user.get("name", ""))
+
+
+def _apply_local_type_filter(entity: str, filters: dict, records: list):
+    filter_type = filters.get("type")
+    filter_values = filters.get("types", []) or []
+
+    if not filter_type or not filter_values:
+        return records
+
+    entity_config = ENTITY_REGISTRY.get(entity, {})
+    field_name = entity_config.get("type_filter_field")
+
+    if not field_name:
+        return records
+    print("FIELD NAME:", field_name)
+    print("FILTER TYPE:", filter_type)
+    print("FILTER VALUES:", filter_values)
+    print("BEFORE FILTER:", records)
+
+    normalized_values = [clean_text(value) for value in filter_values]
+
+    if filter_type == "exclude":
+        filtered = [
+        item for item in records
+        if not any(
+            value in clean_text(
+                str(item.get(field_name, ""))
+            )
+            for value in normalized_values
+        )
+    ]
+
+        print("AFTER FILTER:", filtered)
+
+        return filtered
+
+    if filter_type == "include":
+        filtered = [
+        item for item in records
+        if any(
+            value in clean_text(
+                str(item.get(field_name, ""))
+            )
+            for value in normalized_values
+        )
+    ]
+
+        print("AFTER FILTER:", filtered)
+
+        return filtered
+    print(
+    "FILTER DEBUG:",
+    filter_type,
+    filter_values,
+    field_name
+)
+    return records
+
+
+def _build_employee_choices(employee_records: list):
+    response = "Multiple employees found:\n\n"
+
+    for index, emp in enumerate(employee_records, start=1):
+        response += (
+            f"{index}. "
+            f"{emp.get('employee_name')} | "
+            f"{emp.get('employee_code')} | "
+            f"{emp.get('department')} | "
+            f"{emp.get('designation')}\n"
+        )
+
+    response += "\nPlease specify employee name or employee code."
+    return response
+
+
+def _resolve_target_employee(
+    entity: str,
+    target: str,
+    filters: dict,
+    user: dict,
+    token: str
+):
+    employee_names = filters.get("employee_names", [])
+    employee_name = filters.get("employee_name", "")
+    if employee_names:
+
+        resolved_employees = []
+
+        for emp_name in employee_names:
+
+            employee_result = resolve_employee(
+                employee_name=emp_name,
+                token=token,
+                user=user
+            )
+
+            if not employee_result.get("success"):
+                continue
+
+            resolved_employees.extend(
+                employee_result.get("data", [])
+            )
+
+        if not resolved_employees:
+            return "No employees found."
+
+        filters["resolved_employees"] = resolved_employees
+
+        filters["employee_guids"] = [
+            emp["employee_guid"]
+            for emp in resolved_employees
+        ]
+
+        return None
+
+    # If normal user asks for any named employee who is not clearly himself/herself,
+    # deny before search to avoid leaking whether that person exists.
+    if employee_name:
+        # HR/Admin = full access
+        # Others = allow through — can_read_entity will check manager relationship
+        if (
+            not _is_hr_or_admin(user)
+            and not _same_person_name(employee_name, user)
+        ):
+            # Don't block here — let can_read_entity check manager relationship
+            pass
+    # If the typed name is the logged-in user's own name, treat as self.
+    if _same_person_name(employee_name, user):
+        filters["employee_guid"] = user.get("user_guid")
+        filters["resolved_employee_name"] = user.get("name")
+        filters["resolved_employee_code"] = ""
+        return None
+
+    # ------------------------------------------------------------------
+    # Resolve lookup filters to GUIDs.
+    # bam_designation / bam_department / bam_manager are LookupType fields,
+    # so CRM can only filter them by GUID (text -> Guid parse error).
+    # We resolve the human-readable name to a GUID here; the query builder
+    # then filters by that GUID.
+    #   Designation -> cor_designation (name field: cor_name)
+    #   Department  -> cor_department  (name field: cor_name)
+    #   Manager     -> bam_employee    (a manager is an employee)
+    # If a name was given but nothing resolved, return a clear message
+    # instead of silently dropping the filter (which would return everyone).
+    # ------------------------------------------------------------------
+
+    # Single designation -> GUID
+    if filters.get("designation") and not filters.get("designation_guid"):
+        guid = _resolve_lookup_guid(
+            "cor_designation", filters["designation"], "cor_name", token, user
+        )
+        if guid:
+            filters["designation_guid"] = guid
+            print("DESIGNATION GUID:", guid)
+        else:
+            return f"No designation found matching '{filters['designation']}'."
+
+    # Multiple designations (e.g. "team member or intern") -> list of GUIDs
+    if filters.get("designations") and not filters.get("designation_guids"):
+        guids = []
+        for name in filters["designations"]:
+            g = _resolve_lookup_guid(
+                "cor_designation", name, "cor_name", token, user
+            )
+            if g:
+                guids.append(g)
+        if guids:
+            filters["designation_guids"] = guids
+            print("DESIGNATION GUIDS:", guids)
+        else:
+            return (
+                "No matching designations found for "
+                f"{filters['designations']}."
+            )
+
+    # Department -> GUID
+    if filters.get("department") and not filters.get("department_guid"):
+        guid = _resolve_lookup_guid(
+            "cor_department", filters["department"], "cor_name", token, user
+        )
+        if guid:
+            filters["department_guid"] = guid
+            print("DEPARTMENT GUID:", guid)
+        else:
+            return f"No department found matching '{filters['department']}'."
+
+    # Multiple departments (e.g. "project or finance") -> list of GUIDs
+    if filters.get("departments") and not filters.get("department_guids"):
+        dept_guids = []
+        for name in filters["departments"]:
+            g = _resolve_lookup_guid(
+                "cor_department", name, "cor_name", token, user
+            )
+            if g:
+                dept_guids.append(g)
+        if dept_guids:
+            filters["department_guids"] = dept_guids
+            print("DEPARTMENT GUIDS:", dept_guids)
+        else:
+            return (
+                "No matching departments found for "
+                f"{filters['departments']}."
+            )
+
+    # Manager (a manager is itself an employee) -> employee GUID
+    if filters.get("manager") and not filters.get("manager_guid"):
+        mgr_result = resolve_employee(
+            employee_name=filters["manager"], token=token, user=user
+        )
+        mgr_records = mgr_result.get("data", []) if mgr_result.get("success") else []
+        if len(mgr_records) == 1:
+            filters["manager_guid"] = mgr_records[0].get("employee_guid")
+        elif len(mgr_records) > 1:
+            exact = [
+                r for r in mgr_records
+                if clean_text(r.get("employee_name", "")) == clean_text(filters["manager"])
+            ]
+            if len(exact) == 1:
+                filters["manager_guid"] = exact[0].get("employee_guid")
+            else:
+                return _build_employee_choices(mgr_records)
+        else:
+            return f"No manager found matching '{filters['manager']}'."
+        print("MANAGER GUID:", filters.get("manager_guid"))
+
+    # Multiple managers (e.g. "manager is shashank or rahul") -> list of GUIDs.
+    # Per-name: take the single match, or the exact-name match if ambiguous;
+    # skip a name only if it can't be resolved unambiguously.
+    if filters.get("managers") and not filters.get("manager_guids"):
+        mgr_guids = []
+        for name in filters["managers"]:
+            res = resolve_employee(employee_name=name, token=token, user=user)
+            recs = res.get("data", []) if res.get("success") else []
+            if len(recs) == 1:
+                mgr_guids.append(recs[0].get("employee_guid"))
+            elif len(recs) > 1:
+                exact = [
+                    r for r in recs
+                    if clean_text(r.get("employee_name", "")) == clean_text(name)
+                ]
+                if len(exact) == 1:
+                    mgr_guids.append(exact[0].get("employee_guid"))
+        mgr_guids = [g for g in mgr_guids if g]
+        if mgr_guids:
+            filters["manager_guids"] = mgr_guids
+            print("MANAGER GUIDS:", mgr_guids)
+        else:
+            return f"No matching managers found for {filters['managers']}."
+
+    # Self query — employee_name empty hai toh user_guid se fetch karo
+    # LEKIN agar koi search filter hai toh self-resolve mat karo
+    has_search_filter = (
+        filters.get("starts_with") or
+        filters.get("designation") or
+        filters.get("designations") or
+        filters.get("department") or
+        filters.get("departments") or
+        filters.get("manager") or
+        filters.get("managers") or
+        filters.get("experience_gt") not in (None, "", []) or
+        filters.get("experience_gte") not in (None, "", []) or
+        filters.get("experience_lt") not in (None, "", []) or
+        filters.get("experience_lte") not in (None, "", []) or
+        target == "multiple"
+    )
+
+    if not employee_name and not has_search_filter:
+        if user.get("user_guid"):
+            filters["employee_guid"] = user.get("user_guid")
+            filters["resolved_employee_name"] = user.get("name", "")
+            filters["resolved_employee_code"] = ""
+            return None
+        return "Unable to identify current user."
+
+    if not employee_name and has_search_filter:
+        # Search filter hai — employee_guid set mat karo
+        return None
+
+    employee_result = resolve_employee(
+        employee_name=employee_name,
+        token=token,
+        user=user
+    )
+
+    if not employee_result.get("success"):
+        return "Unable to search employee."
+
+    employee_records = employee_result.get("data", [])
+
+    if not employee_records:
+        return f"No employee found with name {employee_name}."
+
+    if len(employee_records) > 1:
+        exact_matches = [
+            emp for emp in employee_records
+            if clean_text(emp.get("employee_name", "")) == clean_text(employee_name)
+            or clean_text(emp.get("employee_code", "")) == clean_text(employee_name)
+        ]
+
+        if len(exact_matches) == 1:
+            employee_records = exact_matches
+        else:
+            return _build_employee_choices(employee_records)
+
+    employee_guid = employee_records[0].get("employee_guid")
+
+    if not employee_guid:
+        return "Unable to identify employee."
+
+    filters["employee_guid"] = employee_guid
+    filters["resolved_employee_name"] = employee_records[0].get("employee_name")
+    filters["resolved_employee_code"] = employee_records[0].get("employee_code")
+
+    return None
+
+def fetch_data_only(
+    decision: dict,
+    user: dict,
+    token: str
+):
+    entity = decision.get("entity")
+    filters = decision.get("filters", {}) or {}
+    target = decision.get("target", "self")
+
+    resolve_error = _resolve_target_employee(
+        entity=entity,
+        target=target,
+        filters=filters,
+        user=user,
+        token=token
+    )
+    
+    if resolve_error:
+        return {
+            "success": False,
+            "message": resolve_error
+        }
+
+    crm_query = build_dynamic_query(
+        entity_name=entity,
+        filters={**filters, "target": target},
+        current_user=user
+    )
+
+    data = execute_crm_query(
+        crm_query=crm_query,
+        token=token,
+        user=user
+    )
+
+    if not data.get("success"):
+        return data
+
+    records = data.get("data", [])
+    
+    records = _apply_local_type_filter(
+        entity,
+        filters,
+        records
+    )
+
+    return {
+        "success": True,
+        "employee_name": filters.get(
+            "resolved_employee_name",
+            filters.get("employee_name")
+        ),
+        "records": records,
+        "formatted_response": format_records(records)
+    }
+
+def execute(
+    decision: dict,
+    user: dict,
+    token: str
+):
+    entity = decision.get("entity")
+    operation = decision.get("operation", "read")
+    filters = decision.get("filters", {}) or {}
+    target = decision.get("target", "self")
+    # ----------------------------------
+    # MULTIPLE EMPLOYEE SUPPORT
+    # ----------------------------------
+
+     
+    if not entity:
+        return "I could not understand which HR information you need. Please ask with employee, leave, or leave history details."
+
+    if entity not in ENTITY_REGISTRY:
+        return f"{entity} is not configured yet."
+
+    if operation != "read":
+        return "This action is not supported yet."
+
+    # Attendance: resolve the date window from the message. Future dates don't
+    # exist, so short-circuit with a friendly message; otherwise inject the
+    # date range (+ optional System/Office Hours) into the filters.
+    if entity == "attendance":
+        from app.services.attendance_window import resolve_attendance_window
+        win = resolve_attendance_window(decision.get("original_message", "") or "")
+        if win.get("error_message"):
+            return win["error_message"]
+        filters["date_from"] = win.get("date_from")
+        filters["date_to"] = win.get("date_to")
+        if win.get("marked_by"):
+            filters["marked_by"] = win["marked_by"]
+
+    # Resolve person name before building query.
+    resolve_error = _resolve_target_employee(
+        entity=entity,
+        target=target,
+        filters=filters,
+        user=user,
+        token=token
+    )
+    print("AFTER RESOLVE FILTERS:", filters)
+    if resolve_error:
+        return resolve_error
+
+    allowed = can_read_entity(
+        entity=entity,
+        current_user=user,
+        target_employee=filters.get("employee_guid"),
+        token=token
+    )
+
+    if not allowed:
+        return "You are not authorized to view other employees' data."
+
+    if target == "employee" and entity != "employee" and not filters.get("employee_guid"):
+        return "Unable to identify employee."
+
+    if target == "employee" and entity == "employee" and not filters.get("employee_guid") and not filters.get("employee_name"):
+        return "Unable to identify employee."
+    
+    crm_query = build_dynamic_query(
+        entity_name=entity,
+        filters={**filters, "target": target},
+        current_user=user
+    )
+
+    data = execute_crm_query(
+        crm_query=crm_query,
+        token=token,
+        user=user
+    )
+
+    if not data.get("success"):
+
+        print(
+        "CRM FETCH ERROR:",
+        data.get("message")
+        )
+
+        return (
+                "Sorry, I was unable "
+                "to fetch the requested "
+                "HR data right now."
+        )
+
+    records = data.get("data", [])
+    print("BEFORE FILTER:", records)
+
+    records = _apply_local_type_filter(
+        entity,
+        filters,
+        records
+    )
+    print("AFTER FILTER:", records)
+
+    # Large plain list -> structured paginated response (count + Show more).
+    paginated = _maybe_paginate_list(decision, entity, target, records)
+    if paginated is not None:
+        print("PAGINATED LIST:", len(records), "records")
+        return paginated
+
+    formatted_response = format_records(records)
+    print("FINAL RECORDS:", records)
+    print("FORMATTED:", formatted_response)
+    response = build_ai_response_stream(
+        user_message=decision.get("original_message", ""),
+        decision=decision,
+        result={
+            "success": True,
+            "data": records,
+            "formatted_response": formatted_response
+        }
+    )
+    print(type(response))
+    return response

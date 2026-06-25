@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ENZO | HR Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="app-shell" aria-label="ENZO HR assistant">
+    <section class="chat-panel">
+        <header class="chat-header">
+            <div class="brand-lockup">
+                <div class="brand-mark" aria-hidden="true">E</div>
+                <div>
+                    <h1>ENZO</h1>
+                    <p>HR assistant</p>
+                </div>
+            </div>
+            <div class="status-pill" id="statusPill">
+                <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+                <span id="statusText">Ready</span>
+            </div>
+        </header>
+
+        <div class="chat-box" id="chatBox" aria-live="polite" aria-label="Conversation">
+            <div class="bot-message" id="greeting">
+                <span class="message-kicker">ENZO</span>
+                Hi 👋 I'm ENZO. Ask me about leave or employees.
+            </div>
+        </div>
+
+        <form class="input-container" id="chatForm">
+            <label class="sr-only" for="messageInput">Message ENZO</label>
+            <input
+                type="text"
+                id="messageInput"
+                placeholder="Ask ENZO about leave or employees..."
+                autocomplete="off"
+            >
+
+            <button id="voiceBtn" type="button" onclick="startVoice()" title="Voice input" aria-label="Voice input">
+                <span aria-hidden="true">Mic</span>
+            </button>
+
+            <button id="sendBtn" type="button" onclick="handleSendBtn()" title="Send" aria-label="Send message">
+                <span aria-hidden="true">Send</span>
+            </button>
+
+            <div class="input-blocker" id="inputBlocker" aria-live="assertive">
+                <span class="blocker-text">Complete or cancel the current action</span>
+                <button class="cancel-flow-btn" type="button" onclick="cancelFlow()">Cancel</button>
+            </div>
+        </form>
+    </section>
+</main>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
