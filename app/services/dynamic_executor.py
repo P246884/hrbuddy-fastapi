@@ -1,6 +1,7 @@
 import types
 import json
 import random
+import re
 
 from app.crm.crm_query_builder import build_dynamic_query
 from app.crm.crm_executor import execute_crm_query
@@ -133,7 +134,7 @@ def _maybe_paginate_list(decision, entity, target, records):
     if not (is_employee_list or is_history_list):
         return None
     # insight / count / month / balance queries keep their short answer
-    if any(w in msg for w in _LIST_INSIGHT_WORDS) or any(m in msg for m in _LIST_MONTHS):
+    if any(w in msg for w in _LIST_INSIGHT_WORDS):
         return None
 
     filters = decision.get("filters", {}) or {}
@@ -147,6 +148,115 @@ def _maybe_paginate_list(decision, entity, target, records):
         "page_size": _page_size(len(records)),
         "items": items,
     })
+
+
+def _subject_label(filters, target, suffix):
+    """'your <suffix>' for self, '<Name>'s <suffix>' when viewing someone else."""
+    name = " ".join((filters.get("resolved_employee_name") or "").split())
+    if name.isupper():
+        name = name.title()
+    if target != "self" and name:
+        return name + "'s " + suffix
+    return "your " + suffix
+
+
+def _balance_response(decision, target, records):
+    """One card per leave type with its remaining days (low balances flagged)."""
+    filters = decision.get("filters", {}) or {}
+    items = []
+    for r in records:
+        try:
+            bal = float(r.get("balance"))
+        except (TypeError, ValueError):
+            bal = None
+        items.append({"type": r.get("leave_type") or "Leave", "balance": bal})
+    intro = "Here are " + _subject_label(filters, target, "leave balances") + "."
+    return json.dumps({"type": "balance", "intro": intro, "items": items})
+
+
+def _profile_response(decision, target, record):
+    """A single employee profile rendered as a clean detail card."""
+    filters = decision.get("filters", {}) or {}
+    name = record.get("employee_name") or record.get("name") or "Employee"
+    exp = record.get("experience")
+    exp_str = ""
+    if exp not in (None, ""):
+        try:
+            exp_str = (str(int(float(exp))) if float(exp).is_integer()
+                       else str(float(exp))) + " yrs"
+        except (TypeError, ValueError):
+            exp_str = str(exp)
+    raw = [
+        ("Code", record.get("employee_code") or record.get("code")),
+        ("Department", record.get("department")),
+        ("Designation", record.get("designation")),
+        ("Experience", exp_str),
+        ("Manager", record.get("manager")),
+    ]
+    fields = [[k, str(v)] for k, v in raw if v not in (None, "", "None")]
+    intro = ("Here's your profile." if target == "self"
+             else "Here's " + (name.title() if name.isupper() else name) + "'s profile.")
+    return json.dumps({"type": "profile", "intro": intro,
+                       "name": name, "fields": fields})
+
+
+def _grouped_balance(decision, filters, user, token):
+    """Fetch each named person's balance separately and return a per-person
+    grouped response (the base for comparisons). Each group is one employee."""
+    resolved = filters.get("resolved_employees", []) or []
+    base = {k: v for k, v in filters.items()
+            if k not in ("employee_guids", "employee_names", "resolved_employees",
+                         "employee_guid", "resolved_employee_name")}
+    groups = []
+    for emp in resolved:
+        guid = emp.get("employee_guid")
+        nm = emp.get("employee_name") or emp.get("name") or "Employee"
+        nm = nm.title() if nm.isupper() else nm
+        if not guid:
+            continue
+        if not can_read_entity(entity="leave", current_user=user,
+                               target_employee=guid, token=token):
+            groups.append({"name": nm, "denied": True, "items": []})
+            continue
+        q = build_dynamic_query(
+            entity_name="leave",
+            filters={**base, "employee_guid": guid, "target": "employee"},
+            current_user=user,
+        )
+        data = execute_crm_query(crm_query=q, token=token, user=user)
+        recs = data.get("data", []) if data.get("success") else []
+        items = []
+        for r in recs:
+            try:
+                bal = float(r.get("balance"))
+            except (TypeError, ValueError):
+                bal = None
+            items.append({"type": r.get("leave_type") or "Leave", "balance": bal})
+        groups.append({"name": nm, "items": items})
+
+    if not groups:
+        return "No employees found."
+    return json.dumps({
+        "type": "balance_group",
+        "intro": "Leave balance — " + ", ".join(g["name"] for g in groups),
+        "groups": groups,
+    })
+
+
+def _structured_response(decision, entity, target, records):
+    """Pick the prettiest structured card for a plain display read, else None."""
+    if not records:
+        return None
+    if entity == "leave":
+        return _balance_response(decision, target, records)
+    if entity == "employee":
+        # one person -> profile card (works for "my profile" and "X's profile");
+        # several -> the list cards.
+        if len(records) == 1 and target != "multiple":
+            return _profile_response(decision, target, records[0])
+        return _maybe_paginate_list(decision, entity, "multiple", records)
+    return _maybe_paginate_list(decision, entity, target, records)
+
 def _is_hr_or_admin(user: dict) -> bool:
     return bool(user.get("is_hr")) or bool(user.get("is_admin"))
 
@@ -603,6 +713,11 @@ def execute(
     if resolve_error:
         return resolve_error
 
+    # Multi-person LEAVE BALANCE ("purav and harshal balance") — fetch each
+    # person separately so the cards are grouped per person (no jumbled merge).
+    if entity == "leave" and len(filters.get("employee_guids", []) or []) > 1:
+        return _grouped_balance(decision, filters, user, token)
+
     allowed = can_read_entity(
         entity=entity,
         current_user=user,
@@ -654,12 +769,42 @@ def execute(
     )
     print("AFTER FILTER:", records)
 
-    # Large plain list -> structured paginated response (count + Show more).
-    paginated = _maybe_paginate_list(decision, entity, target, records)
-    if paginated is not None:
-        print("PAGINATED LIST:", len(records), "records")
-        return paginated
+    # If the user named a specific month ("...of July"), narrow leave_history
+    # records to that month so "show my pending leaves of July" lists only
+    # July's (and "how many ... in July" counts only July's).
+    if entity == "leave_history" and records:
+        _msg = (decision.get("original_message", "") or "").lower()
+        _mnums = {i + 1 for i, m in enumerate(_LIST_MONTHS)
+                  if re.search(r"\b" + m + r"\b", _msg)}
+        if _mnums:
+            def _rec_month(r):
+                ds = (r.get("from_date") or "")
+                try:
+                    return int(ds[5:7])
+                except (ValueError, IndexError):
+                    return None
+            filtered = [r for r in records if _rec_month(r) in _mnums]
+            records = filtered
 
+    # 1) A specific question ("can I take 5?", "annual balance", "most used")
+    #    deserves a short, computed sentence — not a card dump.
+    try:
+        from app.ai.response_builder import _smart_answer
+        _smart = _smart_answer(decision.get("original_message", ""), decision, records)
+    except Exception as _e:
+        print("smart-answer skipped:", _e)
+        _smart = None
+    if _smart:
+        print("SMART ANSWER:", _smart)
+        return _smart
+
+    # 2) Plain display -> prettiest structured card (balance / profile / list).
+    structured = _structured_response(decision, entity, target, records)
+    if structured is not None:
+        print("STRUCTURED RESPONSE:", structured[:120])
+        return structured
+
+    # 3) Fallback: stream the formatted text.
     formatted_response = format_records(records)
     print("FINAL RECORDS:", records)
     print("FORMATTED:", formatted_response)

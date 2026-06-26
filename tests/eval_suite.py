@@ -469,9 +469,14 @@ def test_bulk_actions():
     check("bulk", "carry action across 'and'",
           items("reject purav and harshal"),
           [("reject_leave", "purav", "all"), ("reject_leave", "harshal", "all")])
-    check("bulk", "last leave", items("approve last leave of harshal"),
-          [("approve_leave", "harshal", "last")])
-    check("bulk", "plural -> all", items("approve harshal leaves"),
+    check("bulk", "single last leave -> None (picker)",
+          items("approve last leave of harshal"), None)
+    check("bulk", "multi with last scope",
+          items("reject purav's last leave and cancel tanish leave"),
+          [("reject_leave", "purav", "last"), ("cancel_leave", "tanish", "last")])
+    check("bulk", "single plural -> None (picker)", items("approve harshal leaves"), None)
+    check("bulk", "single + all -> bulk all",
+          items("approve all harshal leaves"),
           [("approve_leave", "harshal", "all")])
     check("bulk", "single singular -> None", items("approve harshal leave"), None)
     check("bulk", "negation -> None", items("do not approve harshal"), None)
@@ -532,6 +537,48 @@ def test_weird_queries():
         check("weird", q, _entity_of(normalize_typos(q)), want)
 
 
+def test_name_safety():
+    section("name safety — junk words must NEVER become a person's name")
+    valid = {"purav", "harshal", "vikrant", "tanish", "mayank", "sahil",
+             "rahul", "aditya", "neha", "anil", "sneha", "karan", "piyush",
+             "shashank", "pooja", "chandani", "john", "doe", "harsh",
+             "rastogi", "saxena", "sharma", "patel", "chauhan", "rathi",
+             "monday", "tuesday", "wednesday"}
+    queries = [
+        "could you tell me my leave balance", "please show my balance",
+        "can you check purav balance", "would you mind showing harshal balance",
+        "kindly show my leave balance", "may I know my balance",
+        "I would like to see my leave history", "tell me about purav leaves",
+        "give me a summary of my leaves", "I want to view harshal leave history",
+        "is it possible for me to take 5 days", "do I have enough leave for 10 days",
+        "will I be able to take 3 days annual", "am I allowed to take 7 days",
+        "can harshal afford to take 4 leaves", "could purav take a week off",
+        "I want to apply for sick leave tomorrow", "book annual leave for me next week",
+        "go ahead and cancel tanish leave", "approve harshal and reject purav",
+        "could you approve vikrant and harshal", "reject purav, cancel tanish and approve mayank",
+        "who took the most leaves", "which employee has the highest leave",
+        "employees who took maximum leave in january 2026", "show me the person with least leaves",
+        "approve my leave", "reject my vacation request",
+        "show me everyone in project", "list all staff",
+        "employees with more than 5 years experience", "show me the maximum leave",
+        "give me the latest leave", "show the pending requests", "show upcoming holidays",
+        "what about my annual leave", "show me the total leaves", "show recent leaves",
+        "mujhe meri balance dikhao", "purav ki history batao", "harshal ko approve kardo",
+        "meri pending leaves dikhao", "sabhi employees dikhao", "project wale log dikhao",
+    ]
+    bad = []
+    for q in queries:
+        d = parse_fast_intent(q)
+        nm = (d["filters"].get("employee_name") if d else "") or ""
+        names = (d["filters"].get("employee_names") if d else []) or []
+        for n in ([nm] if nm else []) + list(names):
+            if any(tok not in valid for tok in n.lower().split()):
+                bad.append((q, n))
+                break
+    check("name-safety", str(len(queries)) + " adversarial queries, 0 junk names",
+          bad, [])
+
+
 def main():
     print("HRBuddy eval suite — deterministic layer\n" + "=" * 44)
     test_entity_routing()
@@ -553,6 +600,7 @@ def main():
     test_pagination()
     test_smart_answers()
     test_weird_queries()
+    test_name_safety()
 
     total = _TOTAL["pass"] + _TOTAL["fail"]
     print("\n" + "=" * 44)

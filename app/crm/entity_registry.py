@@ -17,7 +17,12 @@ ENTITY_REGISTRY = {
 "staff",
 "people",
 "colleague",
-"colleagues"
+"colleagues",
+"info",
+"information",
+"details",
+"detail",
+"about"
         ],
 
         "crm_entity": "bam_employee",

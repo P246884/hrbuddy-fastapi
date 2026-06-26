@@ -151,7 +151,8 @@ def _reason_picker_response(message, context):
     return json.dumps({"type": "reason_picker", "message": message, "context": context})
 
 def _leave_picker_response(message, leaves, action, context):
-    return json.dumps({"type": "leave_picker", "message": message, "leaves": leaves, "action": action, "context": context})
+    return json.dumps({"type": "leave_picker", "message": message, "leaves": leaves,
+                       "action": action, "page_size": 4, "context": context})
 
 def _success_response(message):
     return json.dumps({"type": "success", "message": message})
@@ -852,15 +853,39 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
 
     query = build_dynamic_query(
         entity_name="leave_history",
-        filters={"target": "employee", "employee_guid": employee_guid, "status": status_filter, "top": "4"},
+        filters={"target": "employee", "employee_guid": employee_guid,
+                 "status": status_filter, "top": "50"},
         current_user=user
     )
     result = execute_crm_query(crm_query=query, token=token, user=user)
 
     if not result.get("success") or not result.get("data"):
-        return _error_response("No pending leave requests found for " + str(employee_name) + "."), None
+        return _error_response("No " + status_filter + " leave requests found for "
+                               + str(employee_name) + "."), None
 
     leaves = result["data"]
+
+    # date-aware: if the user named a window ("next week", "july", "today"...),
+    # keep only the leaves that fall inside it.
+    period_note = ""
+    try:
+        from app.intent.fast_intent import compute_date_range
+        _fr, _to = compute_date_range(message)
+    except Exception:
+        _fr, _to = "", ""
+    if _fr and _to:
+        def _in_window(lv):
+            s = str(lv.get("from_date", ""))[:10]
+            e = str(lv.get("to_date", "") or lv.get("from_date", ""))[:10]
+            return bool(s) and s <= _to and (e >= _fr if e else True)
+        scoped = [lv for lv in leaves if _in_window(lv)]
+        period_note = " in that period"
+        leaves = scoped
+
+    if not leaves:
+        return _error_response("No " + status_filter + " leaves found for "
+                               + str(employee_name) + period_note + "."), None
+
     leave_options = []
     for leave in leaves:
         lt = leave.get("leave_type", "Leave")
@@ -875,7 +900,7 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
 
     action_label = "Reject" if action == "reject_leave" else "Approve" if action == "approve_leave" else "Cancel"
     return _leave_picker_response(
-        message="Select leave to " + action_label.lower() + " for " + str(employee_name) + ":",
+        message="Select leave to " + action_label.lower() + " for " + str(employee_name) + period_note + ":",
         leaves=leave_options,
         action=action,
         context={}
@@ -984,7 +1009,7 @@ _BULK_SKIP = {
     "the", "their", "his", "her", "its", "of", "for", "to", "please", "plz",
     "kindly", "all", "both", "last", "latest", "recent", "this", "that",
     "pls", "ki", "ka", "ke", "wali", "wala", "vala", "krdo", "kardo", "kr",
-    "do", "the",
+    "do", "the", "code", "with", "id", "number", "employee", "emp", "having",
 }
 
 
@@ -1017,6 +1042,8 @@ def parse_bulk_actions(message):
     last_action = None
     for chunk in chunks:
         ctoks = re.findall(r"[a-z]+", chunk)
+        code_m = re.search(r"\b(\d{3,})\b", chunk)
+        code = code_m.group(1) if code_m else ""
         action = None
         name_toks = []
         for t in ctoks:
@@ -1031,15 +1058,21 @@ def parse_bulk_actions(message):
             last_action = action
         use_action = action or last_action
         # only approve/reject/cancel are bulk-able (apply needs dates)
-        if use_action and use_action != "apply_leave" and name_toks:
-            items.append({"action": use_action, "name": " ".join(name_toks)})
+        if use_action and use_action != "apply_leave" and (name_toks or code):
+            item = {"action": use_action, "name": " ".join(name_toks)}
+            if code:
+                item["code"] = code
+            items.append(item)
 
     if not items:
         return None
 
     has_last = bool(re.search(r"\blast\b|\blatest\b", raw))
-    has_plural = bool(re.search(r"\bleaves\b", raw))
-    is_bulk = len(items) > 1 or has_plural or has_last
+    has_all = bool(re.search(r"\ball\b", raw))
+    # Bulk = several people/actions, OR a single person with an explicit "all"
+    # ("approve all harshal's leaves"). A plain "approve harshal's leaves" is a
+    # SINGLE-person request -> goes to the leave picker (pick which one).
+    is_bulk = len(items) > 1 or (len(items) == 1 and has_all)
     if not is_bulk:
         return None
 
@@ -1062,6 +1095,26 @@ def _requested_leaves_for(employee_guid, token, user, top="50"):
     if result.get("success"):
         return result.get("data", []) or []
     return []
+
+
+def confirm_bulk_response(items, message, prefix=""):
+    """Build a 'confirm' response that summarises a bulk action and stores it,
+    so the user's next reply (yes/no/haan/naa) decides whether to run it."""
+    verb_map = {"approve_leave": "approve", "reject_leave": "reject",
+                "cancel_leave": "cancel"}
+    parts = []
+    for it in items:
+        v = verb_map.get(it["action"], "process")
+        scope = "the latest" if it.get("scope") == "last" else "all requested"
+        parts.append(v + " " + scope + " leave(s) for " + title_name(it["name"]))
+    summary = "; ".join(parts)
+    msg = (prefix + "Just to confirm \u2014 you want me to " + summary +
+           ". Shall I proceed? (yes / no)")
+    return json.dumps({
+        "type": "confirm",
+        "message": msg,
+        "context": {"_confirm": "bulk", "items": items, "message": message},
+    })
 
 
 def handle_bulk_action(items, message, user, token):
@@ -1089,8 +1142,13 @@ def handle_bulk_action(items, message, user, token):
                          + action.split("_")[0] + " their leave.")
             continue
 
-        emp = resolve_employee(employee_name=name, token=token, user=user)
+        code = it.get("code", "")
+        emp = resolve_employee(employee_name=name, token=token, user=user,
+                               employee_code=code) if code else \
+            resolve_employee(employee_name=name, token=token, user=user)
         recs = emp.get("data", []) if emp.get("success") else []
+        if len(recs) > 1 and code:
+            recs = [r for r in recs if str(r.get("employee_code")) == str(code)] or recs
         if len(recs) > 1:
             recs = narrow_employee_records(recs, message)
         if not recs:
@@ -1098,7 +1156,7 @@ def handle_bulk_action(items, message, user, token):
             continue
         if len(recs) > 1:
             lines.append("\u26a0\ufe0f " + disp + ": multiple employees match — "
-                         "please use the full name or employee code.")
+                         "please add the employee code (e.g. \"" + disp + " code 1234\").")
             continue
 
         emp_guid = recs[0].get("employee_guid")

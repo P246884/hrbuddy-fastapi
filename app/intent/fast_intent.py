@@ -1,6 +1,8 @@
 import re
 import random
 import difflib
+import calendar
+from datetime import date, timedelta
 from dateutil import parser
 
 from app.crm.entity_registry import ENTITY_REGISTRY
@@ -97,6 +99,11 @@ _VOCAB = {
     "manager", "department", "designation", "experience", "name",
     "most", "average", "total", "count", "month", "today", "tomorrow",
     "yesterday",
+    # valid words that must NOT be auto-corrected into a similar domain word
+    # (e.g. "request" -> "requested" used to break cancel/approve detection)
+    "request", "requests", "vacation", "vacations", "holiday", "holidays",
+    "week", "weeks", "year", "years", "current", "next", "last", "this",
+    "info", "information", "about",
 }
 # very common short typos (< 4 chars) that fuzzy matching is too risky for
 _SHORT_TYPO_MAP = {
@@ -213,12 +220,87 @@ def resolve_entity(message: str):
     return best_match
 
 
+def compute_date_range(message, today=None):
+    """Turn natural date language into a concrete (from_iso, to_iso) window.
+    Covers: today / current date, tomorrow, yesterday, this|current week,
+    next week, last|previous week, this|current month, next month,
+    last|previous month, this|current year, and a named month (e.g. July).
+    Returns ("", "") when nothing matches."""
+    msg = clean_text(message)
+    today = today or date.today()
+
+    def iso(d):
+        return d.isoformat()
+
+    def month_range(y, m):
+        last = calendar.monthrange(y, m)[1]
+        return iso(date(y, m, 1)), iso(date(y, m, last))
+
+    def week_range(anchor):
+        start = anchor - timedelta(days=anchor.weekday())  # Monday
+        return iso(start), iso(start + timedelta(days=6))
+
+    # --- day level ---
+    if re.search(r"\b(today|current date|todays|todays date|aaj)\b", msg):
+        return iso(today), iso(today)
+    if re.search(r"\b(tomorrow|tmrw|tomorow)\b", msg):
+        d = today + timedelta(days=1)
+        return iso(d), iso(d)
+    if re.search(r"\byesterday\b", msg):
+        d = today - timedelta(days=1)
+        return iso(d), iso(d)
+
+    # --- week level ---
+    if re.search(r"\b(next week|coming week|upcoming week|agle hafte|agle week)\b", msg):
+        return week_range(today + timedelta(days=7))
+    if re.search(r"\b(last week|previous week|past week|pichle hafte)\b", msg):
+        return week_range(today - timedelta(days=7))
+    if re.search(r"\b(this week|current week|is hafte|is week)\b", msg):
+        return week_range(today)
+
+    # --- month level ---
+    if re.search(r"\b(next month|coming month|upcoming month|agle mahine|agle month)\b", msg):
+        y, m = (today.year + (1 if today.month == 12 else 0),
+                1 if today.month == 12 else today.month + 1)
+        return month_range(y, m)
+    if re.search(r"\b(last month|previous month|past month|pichle mahine)\b", msg):
+        y, m = (today.year - (1 if today.month == 1 else 0),
+                12 if today.month == 1 else today.month - 1)
+        return month_range(y, m)
+    if re.search(r"\b(this month|current month|is mahine|is month)\b", msg):
+        return month_range(today.year, today.month)
+
+    # --- year level ---
+    if re.search(r"\b(this year|current year|is saal)\b", msg):
+        return iso(date(today.year, 1, 1)), iso(date(today.year, 12, 31))
+    if re.search(r"\b(next year|coming year)\b", msg):
+        return iso(date(today.year + 1, 1, 1)), iso(date(today.year + 1, 12, 31))
+    if re.search(r"\b(last year|previous year)\b", msg):
+        return iso(date(today.year - 1, 1, 1)), iso(date(today.year - 1, 12, 31))
+
+    # --- a specific named month (optionally with a 4-digit year) ---
+    months = ["january", "february", "march", "april", "may", "june", "july",
+              "august", "september", "october", "november", "december"]
+    for i, name in enumerate(months):
+        if re.search(r"\b" + name + r"\b", msg) or re.search(r"\b" + name[:3] + r"\b", msg):
+            ym = re.search(r"\b(20\d{2})\b", msg)
+            yr = int(ym.group(1)) if ym else today.year
+            return month_range(yr, i + 1)
+
+    return "", ""
+
+
 def extract_statuses(msg: str):
     statuses = []
+    # synonyms first: "pending"/"awaiting"/"unapproved" all mean requested
+    if any(w in msg for w in ("pending", "awaiting", "unapproved",
+                              "not approved", "to be approved", "yet to")):
+        statuses.append("requested")
     for status in ["approved", "rejected", "requested", "cancelled", "canceled"]:
         if status in msg:
             normalized = "cancelled" if status == "canceled" else status
-            statuses.append(normalized)
+            if normalized not in statuses:
+                statuses.append(normalized)
     return ",".join(statuses)
 
 
@@ -411,6 +493,21 @@ NON_NAME_QUALIFIERS = {
     "august", "september", "october", "november", "december",
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct",
     "nov", "dec",
+    # aggregate / ranking / question words — never names
+    "maximum", "max", "minimum", "min", "least", "most", "highest", "lowest",
+    "top", "more", "less", "fewer", "took", "taken", "who", "whom", "whose",
+    "which", "whoever", "everyone", "anybody", "somebody",
+    # date / misc words that leak into queries
+    "next", "last", "week", "weeks", "month", "months", "year", "years",
+    "tomorrow", "today", "yesterday", "vacation", "holiday", "request",
+    "requests", "coming", "upcoming", "this", "that",
+    # politeness / modal / filler — never names
+    "please", "kindly", "could", "would", "should", "shall", "may", "might",
+    "will", "can", "go", "ahead", "let", "know", "tell", "give", "show",
+    "want", "wanna", "need", "like", "view", "see", "possible", "enough",
+    "able", "allowed", "afford", "mind", "around", "about", "summary",
+    "recent", "total", "remaining", "pending", "me", "for", "be", "able",
+    "myself", "kar", "krdo", "kardo", "dikhao", "batao", "do", "the",
 }
 
 
@@ -749,8 +846,23 @@ def parse_fast_intent(message: str):
         filters.update(extract_time_filters(msg))
         filters.update(extract_date_range(msg))
         filters.update(extract_year(msg))
+        # relative windows: "next week", "this month", "july", "today"...
+        if not filters.get("from_date") and not filters.get("to_date"):
+            _fr, _to = compute_date_range(message)
+            if _fr:
+                filters["from_date"] = _fr
+                filters["to_date"] = _to
 
     employee_names = extract_employee_names(message)
+    # strip domain/filler tokens from each candidate (e.g. "go ahead" -> "",
+    # "cancel tanish" -> "Tanish") and drop empties
+    _cleaned_names = []
+    for _nm in employee_names:
+        _kept = " ".join(w for w in _nm.split()
+                         if clean_text(w) not in NON_NAME_QUALIFIERS).strip()
+        if _kept:
+            _cleaned_names.append(_kept)
+    employee_names = _cleaned_names
     employee_name = ""
     if len(employee_names) > 1:
         filters["employee_names"] = employee_names

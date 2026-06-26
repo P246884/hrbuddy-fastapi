@@ -1,0 +1,145 @@
+
+======================================================================
+READ-ONLY QUERIES (safe)
+======================================================================
+
+--- balance (self) ---
+▶ my leave balance
+   → Leave Balance - Comp Off: 10 days - Carry Forward: 0.5 days - Sick Leave: 14 days - Annual Leave: 8 days
+▶ show my leave balance
+   → Leave Balance - Comp Off: 10 days - Carry Forward: 0.5 days - Sick Leave: 14 days - Annual Leave: 8 days
+▶ what's my annual leave balance
+   → Your Annual Leave balance stands at 8 days.
+▶ anual leav balnce
+   → You currently have 8 days of Annual Leave remaining.
+▶ sick leave balance kitni hai
+   → No employee found with name Hai.
+▶ comp off balance
+   → I'm sorry but you currently have 10 days of Comp Off remaining.
+▶ how many carry forward left
+   → You have 0.5 days of Carry Forward remaining.
+▶ mera annual leave kitna bacha hai
+   → You have 8 days of Annual Leave remaining.
+
+--- feasibility / projection (self) ---
+▶ can i take 5 days annual leave
+   → Yes, you can take 5 days of your available 8 Annual Leave days.
+▶ can i take 20 days annual leave
+   → I'm sorry but due to your current 8 days of Annual Leave, we only have 8 available and not the requested 20 days.
+▶ if i take 3 days annual leave what will my balance be
+   → If you take 3 days of Annual Leave, your balance will be 5 days.
+▶ am i close to exhausting my balance
+   → Yes you're close, your Carry Forward balance is just 0.5 days.
+▶ can i take 2 leaves next month
+   → Yes, you can take 2 leaves next month as you have 8 days of Annual Leave remaining.
+
+--- leave history (self) ---
+▶ show my leave history
+   → [list] Here's your leave history — 27 record(s).  ::  Comp Off [Requested] | Annual Leave [Requested] | Sick Leave [Requested] ...
+▶ my leaves
+   → [list] Found 27 leave record(s) for you.  ::  Comp Off [Requested] | Annual Leave [Requested] | Sick Leave [Requested] ...
+▶ how many leaves did i take in january
+   → You took 1 leave(s) in January, totalling 1 days.
+▶ how many sick leaves did i take
+   → You took 8 sick leave, totalling 16 days.
+▶ total leaves i took this year
+   → You've taken a total of 27 leaves amounting to 63 days this year.
+▶ which leave type have i used the most
+   → You've used Annual Leave the most – 20 days across 11 requests.
+▶ which month do i take most leaves
+   → In June you took the most leave with 21 days across 14 requests.
+▶ what is my average monthly leave usage
+   → Your average monthly leave usage has been around 7 days.
+▶ show my approved leaves
+   → [list] Here's your leave history — 3 record(s).  ::  Carry Forward [Approved] | Annual Leave [Approved] | Annual Leave [Approved]
+▶ my rejected leaves
+   → [list] Here's your leave history — 6 record(s).  ::  Annual Leave [Rejected] | Sick Leave [Rejected] | Sick Leave [Rejected] ...
+▶ my cancelled leaves
+   → [list] Here are your leave records (6).  ::  Comp Off [Cancelled] | Comp Off [Cancelled] | Annual Leave [Cancelled] ...
+▶ my pending leaves
+   → [list] Here's your leave history — 27 record(s).  ::  Comp Off [Requested] | Annual Leave [Requested] | Sick Leave [Requested] ...
+▶ leaves of year 2025
+   → [list] Found 1 leave record(s) for you.  ::  Annual Leave [Rejected]
+
+--- other people (needs HR/manager rights) ---
+▶ history of purav leaves
+   → [list] Found 39 leave record(s) for Purav Sharma.  ::  Sick Leave [Approved] | Annual Leave [Approved] | Carry Forward [Approved] ...
+▶ show mayank leave history
+   → Leave History (19)  1. Carry Forward · 2026-03-27 → 2026-03-27 · 1 days · Approved 2. Carry Forward · 2026-02-05 → 2026-02-05 · 1 days · Approved 3. Sick Leave · 2025-12-26 → 2025-12-26 · 1 days · Approved 4. Carry Forward · 2025-12-29 → 2025-12-30 · 2 days · Approved 5. Sick Leave · 2025-12-04 → 2025-12-05 · 1.5 days · Approved 6. Carry Forward · 2025-11-19 → 2025-11-19 · 0.5 days · Approved 7. Carry Forward · 2025-11-06 → 2025-11-07 · 2 days · Cancelled 8. Annual Leave · 2025-09-30 → 2025-09-3
+▶ purav sick leave balance
+   → You currently have 0.5 days of Sick Leave remaining.
+▶ which leave type harshal have used the most
+   → Harshal frequently used Annual Leave, taking a total of 32 days over 18 requests.
+▶ can purav take 10 days annual leave
+   → Yes, Purav has 10 days of Annual Leave for your use.
+▶ can purav take 10 annual leaves
+   → Yes, Purav has 10 annual leaves, covering a full year's vacation.
+▶ who is manager of purav
+   → Purav Sharma's manager is Shashank Saxena.
+▶ purav's manager
+   → Purav Sharma's manager is Shashank Saxena.
+
+--- employees ---
+▶ show all employees
+   → [list] Here are 70 employees.  ::  POOJA SHARMA | Siddharth  Dwivedi | SUMEET  CHHABRA ...
+▶ list employees
+   → [list] Showing all 70 employees.  ::  POOJA SHARMA | Siddharth  Dwivedi | SUMEET  CHHABRA ...
+▶ show employees
+   → [list] Showing all 70 employees.  ::  POOJA SHARMA | Siddharth  Dwivedi | SUMEET  CHHABRA ...
+▶ employees in project department
+   → [list] Here are the 51 employees in Project.  ::  POOJA SHARMA | SUMEET  CHHABRA | SHIVANI  SHRIVASTAVA ...
+▶ employees in project dept
+   → [list] Found 51 employees in Project.  ::  POOJA SHARMA | SUMEET  CHHABRA | SHIVANI  SHRIVASTAVA ...
+▶ show employees department wise
+   → [list] Found 70 employees in the directory.  ::  POOJA SHARMA | Siddharth  Dwivedi | SUMEET  CHHABRA ...
+▶ employees whose name starts with a
+   → [list] Here are 11 employees.  ::  AAKASH  SHARMA | ANANT  SHARMA | ABHISHEK SINGH TOMAR ...
+▶ employees whose name related to harsh
+   → [list] Here are 3 employees.  ::  HARSHIT  SHARMA | HARSH | HARSHAL PATEL
+▶ who all have experience more than 5 years
+   → [list] Showing all 7 employees.  ::  Siddharth  Dwivedi | SUMEET  CHHABRA | VIVEK BHADAURIYA ...
+▶ show employes
+   → [list] Found 70 employees in the directory.  ::  POOJA SHARMA | Siddharth  Dwivedi | SUMEET  CHHABRA ...
+
+--- self / misc ---
+▶ what is my name
+   → You are Pratham Sharma.
+▶ who am i
+   → I see you, you're Pratham Sharma.
+▶ tell me my name
+   → My friendly reply would be: Hi there! Your name is Pratham Sharma.
+
+--- weird / hinglish / messy ---
+▶ yaar mera leave kitna bacha
+   → Leave Balance - Comp Off: 10 days - Carry Forward: 0.5 days - Sick Leave: 14 days - Annual Leave: 8 days
+▶ purav ka leave history dikhao
+   → [list] Here are Purav Sharma's leave records (39).  ::  Sick Leave [Approved] | Annual Leave [Approved] | Carry Forward [Approved] ...
+▶ plz show me my leav balnce
+   → Leave Balance - Comp Off: 10 days - Carry Forward: 0.5 days - Sick Leave: 14 days - Annual Leave: 8 days
+▶ kitni chutti bची hai
+   → I'm sorry, I don't have the capability to check future dates. You can check your calendar for this information. What specific HR-related question would you like assistance with?
+▶ show me everything about my leaves
+   → [list] Here are your leave records (27).  ::  Comp Off [Requested] | Annual Leave [Requested] | Sick Leave [Requested] ...
+▶ leaves????
+   → [list] Here are your leave records (27).  ::  Comp Off [Requested] | Annual Leave [Requested] | Sick Leave [Requested] ...
+▶     
+   → You can ask questions related to employee details, leave balance, leave history, or the process of applying/approving/rejecting/cancelling leaves for assistance. If you have any specific queries, feel free to ask!
+▶ asdkjfh random text
+   → I can only assist with HR-related queries. Here are some examples of HR questions you can ask:  1. How do I check my leave balance? 2. Can you help me approve a sick leave request?
+
+--- out of scope (should politely decline / coming soon) ---
+▶ tell me a joke
+   → I'm here to help with your HR queries. Here are some examples of HR-related questions you might have:   1. How do I check an employee's leave balance? 2. Can you guide me on how to approve an employee's leave request?  If you need any assistance with these, feel free to ask!
+▶ what is the weather today
+   → I don't have real-time information about current events, including weather updates. I'm here to assist with your HR-related queries. How can I help you with employee details, leave balance, or other HRMS tasks?
+▶ write me python code
+   → I'm here to help with HRMS related tasks. If you have an HR question, I'd be happy to assist. Here are a couple of example questions:  1. How can I check the current leave balance for an employee? 2. Can you guide me on how to approve a leave application?  If you need Python code for something else, please let me know with an HR-related context.
+▶ what is my salary
+   → 🚧 **💰 Salary details** module is coming soon!  I currently support: • 👤 Employee profiles & directory • 📊 Leave balances • 📋 Leave history • ✅ Leave apply / approve / reject / cancel • 📍 Attendance (in/out times, by date)  More modules will be available shortly! 🚀
+▶ book a meeting room
+   → I'm here to help with HR-related queries. Can you please provide more details about the employee's leave balance, their attendance history, or any other HR topic?
+
+(Action queries skipped — set RUN_ACTIONS=True to include them, ideally on a test account.)
+
+======================================================================
+DONE — 60 queries sent. Review above / D:\HRBuddy\hrbuddy-ai-service\tests\run_queries_output.txt

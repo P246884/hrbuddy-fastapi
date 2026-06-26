@@ -665,7 +665,7 @@ def _smart_answer_raw(user_message, decision, records):
             interpretive = any(k in msg for k in (
                 "how many", "how much", "kitni", "kitne", "count", "total",
                 "number of", "did i", "have i",
-            )) or any(re.search(r"\b" + m + r"\b", msg) for m in _SMART_MONTHS)
+            ))
             if not interpretive:
                 return None
 

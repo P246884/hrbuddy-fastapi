@@ -2,6 +2,7 @@ console.log("ENZO chat loaded");
 
 let hrToken = "";
 let pendingActionContext = null;
+let pendingConfirm = null;
 let currentReader = null;
 let isStreaming = false;
 let isActionFlow = false;
@@ -83,7 +84,9 @@ window.addEventListener("message", (event) => {
         const name = (event.data.name || event.data.userName ||
             decodeUserName(hrToken) || "").toString().trim();
         // greet with the first name for a clean, friendly line
-        renderGreeting(name ? name.split(/\s+/)[0] : "");
+        const first = name ? name.split(/\s+/)[0] : "";
+        const pretty = first ? first.charAt(0).toUpperCase() + first.slice(1).toLowerCase() : "";
+        renderGreeting(pretty);
     }
 });
 
@@ -348,15 +351,41 @@ function renderLeavePicker(data) {
 
     const list = document.createElement("div");
     list.className = "leave-options";
-    (data.leaves || []).forEach((leave) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "leave-option-btn";
-        button.textContent = leave.label;
-        button.addEventListener("click", () => selectLeaveForAction(leave.leave_guid, data.action, button));
-        list.appendChild(button);
-    });
     wrapper.appendChild(list);
+
+    const all = data.leaves || [];
+    const pageSize = data.page_size || 4;
+    let shown = 0;
+
+    const moreWrap = document.createElement("div");
+    moreWrap.style.marginTop = "8px";
+
+    function renderNext() {
+        const slice = all.slice(shown, shown + pageSize);
+        slice.forEach((leave) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "leave-option-btn";
+            button.textContent = leave.label;
+            button.addEventListener("click", () => selectLeaveForAction(leave.leave_guid, data.action, button));
+            list.appendChild(button);
+        });
+        shown += slice.length;
+        const left = all.length - shown;
+        moreWrap.innerHTML = "";
+        if (left > 0) {
+            const more = document.createElement("button");
+            more.type = "button";
+            more.className = "leave-option-btn";
+            more.style.opacity = ".75";
+            more.textContent = "Show more (" + left + " more)";
+            more.addEventListener("click", renderNext);
+            moreWrap.appendChild(more);
+        }
+    }
+
+    renderNext();
+    wrapper.appendChild(moreWrap);
     appendMessage(wrapper);
     pendingActionContext = { action: data.action, ...(data.context || {}) };
     blockInput();
@@ -539,6 +568,253 @@ async function sendActionWithContext(context) {
     scrollToBottom();
 }
 
+function renderConfirm(data) {
+    const wrapper = makeMessage("bot-message action-card");
+    wrapper.style.display = "block";
+
+    const title = document.createElement("div");
+    title.className = "action-title";
+    title.textContent = data.message;
+    wrapper.appendChild(title);
+
+    const row = document.createElement("div");
+    row.style.display = "flex";
+    row.style.gap = "8px";
+    row.style.marginTop = "10px";
+
+    const yes = document.createElement("button");
+    yes.type = "button";
+    yes.className = "confirm-btn";
+    yes.textContent = "Yes, proceed";
+    yes.addEventListener("click", () => answerConfirm("yes"));
+
+    const no = document.createElement("button");
+    no.type = "button";
+    no.className = "confirm-btn";
+    no.style.background = "transparent";
+    no.style.border = "0.5px solid rgba(16,24,40,0.25)";
+    no.style.color = "inherit";
+    no.textContent = "No";
+    no.addEventListener("click", () => answerConfirm("no"));
+
+    row.appendChild(yes);
+    row.appendChild(no);
+    wrapper.appendChild(row);
+    appendMessage(wrapper);
+
+    // Store the pending confirmation. We deliberately DO NOT block the input
+    // box — the user may also just type "yes"/"no"/"haan"/"naa".
+    pendingConfirm = data.context;
+}
+
+window.answerConfirm = function (reply) {
+    document.querySelectorAll(".action-card .confirm-btn").forEach((b) => (b.disabled = true));
+    submitReplyWithConfirm(reply);
+};
+
+async function submitReplyWithConfirm(reply) {
+    const ctx = pendingConfirm;
+    pendingConfirm = null;
+    appendMessage(makeMessage("user-message", reply));
+    const botDiv = appendMessage(makeMessage("bot-message"));
+    setThinking(botDiv);
+    try {
+        const response = await fetch(CHAT_ENDPOINT, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + hrToken },
+            body: JSON.stringify({ message: reply, context: ctx })
+        });
+        if (isAuthError(response)) { botDiv.remove(); setUnauthorized(); return; }
+        const ct = response.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+            renderBotResponse(botDiv, await response.json());
+        } else {
+            const txt = (await response.text()).replace(/\x1fLIVE\x1f/g, "");
+            botDiv.innerHTML = renderMarkdown(txt);
+        }
+    } catch (err) {
+        botDiv.textContent = "Something went wrong. Please try again.";
+    }
+    scrollToBottom();
+}
+
+function balanceGrid(items) {
+    const grid = document.createElement("div");
+    grid.style.display = "grid";
+    grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(120px, 1fr))";
+    grid.style.gap = "10px";
+    (items || []).forEach((it) => {
+        const bal = (it.balance === null || it.balance === undefined) ? null : Number(it.balance);
+        const c = document.createElement("div");
+        c.style.border = "1px solid rgba(16,24,40,0.10)";
+        c.style.borderRadius = "12px";
+        c.style.padding = "12px 14px";
+        c.style.background = "rgba(127,127,127,0.04)";
+
+        const type = document.createElement("div");
+        type.style.fontSize = "12px";
+        type.style.fontWeight = "600";
+        type.style.opacity = ".6";
+        type.style.marginBottom = "4px";
+        type.textContent = it.type || "Leave";
+
+        const num = document.createElement("div");
+        num.style.fontSize = "22px";
+        num.style.fontWeight = "700";
+        num.style.lineHeight = "1";
+        num.style.color = "inherit";
+        const shown = (bal === null) ? "—" : (Number.isInteger(bal) ? bal : bal.toFixed(1));
+        const lowTag = (bal !== null && bal <= 2)
+            ? ' <span style="font-size:11px;font-weight:600;opacity:.45">· low</span>' : "";
+        num.innerHTML = shown +
+            ' <span style="font-size:12px;font-weight:600;opacity:.6">days</span>' + lowTag;
+
+        c.appendChild(type);
+        c.appendChild(num);
+        grid.appendChild(c);
+    });
+    return grid;
+}
+
+function renderBalanceGroup(data) {
+    const wrapper = makeMessage("bot-message");
+    wrapper.style.display = "block";
+
+    const head = document.createElement("div");
+    head.style.fontWeight = "500";
+    head.style.marginBottom = "12px";
+    head.textContent = data.intro || "Leave balances";
+    wrapper.appendChild(head);
+
+    (data.groups || []).forEach((g, idx) => {
+        const name = document.createElement("div");
+        name.style.fontWeight = "700";
+        name.style.fontSize = "13px";
+        name.style.margin = (idx ? "14px" : "0") + "0 8px 0";
+        name.style.marginTop = idx ? "14px" : "0";
+        name.style.marginBottom = "8px";
+        name.textContent = g.name;
+        wrapper.appendChild(name);
+
+        if (g.denied) {
+            const d = document.createElement("div");
+            d.style.opacity = ".6";
+            d.style.fontSize = "13px";
+            d.textContent = "Not authorized to view this person's balance.";
+            wrapper.appendChild(d);
+        } else if (!g.items || !g.items.length) {
+            const d = document.createElement("div");
+            d.style.opacity = ".6";
+            d.style.fontSize = "13px";
+            d.textContent = "No balance records found.";
+            wrapper.appendChild(d);
+        } else {
+            wrapper.appendChild(balanceGrid(g.items));
+        }
+    });
+
+    appendMessage(wrapper);
+    scrollToBottom();
+}
+
+function renderBalance(data) {
+    const wrapper = makeMessage("bot-message");
+    wrapper.style.display = "block";
+
+    const head = document.createElement("div");
+    head.style.fontWeight = "500";
+    head.style.marginBottom = "10px";
+    head.textContent = data.intro || "Leave balances";
+    wrapper.appendChild(head);
+
+    wrapper.appendChild(balanceGrid(data.items || []));
+    appendMessage(wrapper);
+    scrollToBottom();
+}
+
+function renderProfile(data) {
+    const wrapper = makeMessage("bot-message");
+    wrapper.style.display = "block";
+
+    if (data.intro) {
+        const head = document.createElement("div");
+        head.style.fontWeight = "500";
+        head.style.marginBottom = "10px";
+        head.textContent = data.intro;
+        wrapper.appendChild(head);
+    }
+
+    const card = document.createElement("div");
+    card.style.border = "1px solid rgba(16,24,40,0.10)";
+    card.style.borderRadius = "12px";
+    card.style.padding = "14px";
+    card.style.background = "rgba(255,255,255,0.65)";
+
+    // header: avatar (initials) + name
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.gap = "12px";
+    header.style.marginBottom = "12px";
+
+    const name = (data.name || "").trim();
+    const pretty = name === name.toUpperCase()
+        ? name.toLowerCase().replace(/\b\w/g, (m) => m.toUpperCase())
+        : name;
+    const initials = pretty.split(/\s+/).map((w) => w[0] || "").slice(0, 2).join("").toUpperCase();
+
+    const avatar = document.createElement("div");
+    avatar.style.width = "42px";
+    avatar.style.height = "42px";
+    avatar.style.borderRadius = "50%";
+    avatar.style.flex = "0 0 auto";
+    avatar.style.display = "flex";
+    avatar.style.alignItems = "center";
+    avatar.style.justifyContent = "center";
+    avatar.style.fontWeight = "700";
+    avatar.style.fontSize = "15px";
+    avatar.style.color = "inherit";
+    avatar.style.opacity = ".8";
+    avatar.style.background = "rgba(16,24,40,0.06)";
+    avatar.textContent = initials || "👤";
+
+    const nameEl = document.createElement("div");
+    nameEl.style.fontWeight = "700";
+    nameEl.style.fontSize = "15px";
+    nameEl.textContent = pretty;
+
+    header.appendChild(avatar);
+    header.appendChild(nameEl);
+    card.appendChild(header);
+
+    // labelled fields grid
+    const grid = document.createElement("div");
+    grid.style.display = "grid";
+    grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(150px, 1fr))";
+    grid.style.gap = "10px 18px";
+    (data.fields || []).forEach((f) => {
+        const cell = document.createElement("div");
+        const label = document.createElement("div");
+        label.style.fontSize = "11px";
+        label.style.opacity = ".55";
+        label.style.textTransform = "uppercase";
+        label.style.letterSpacing = ".03em";
+        label.textContent = f[0];
+        const val = document.createElement("div");
+        val.style.fontSize = "14px";
+        val.style.fontWeight = "500";
+        val.textContent = f[1];
+        cell.appendChild(label);
+        cell.appendChild(val);
+        grid.appendChild(cell);
+    });
+    card.appendChild(grid);
+
+    wrapper.appendChild(card);
+    appendMessage(wrapper);
+    scrollToBottom();
+}
+
 function renderList(data) {
     const items = data.items || [];
     const pageSize = data.page_size || 5;
@@ -672,6 +948,22 @@ function renderBotResponse(botDiv, data) {
                 botDiv.remove();
                 renderList(data);
                 break;
+            case "balance":
+                botDiv.remove();
+                renderBalance(data);
+                break;
+            case "balance_group":
+                botDiv.remove();
+                renderBalanceGroup(data);
+                break;
+            case "profile":
+                botDiv.remove();
+                renderProfile(data);
+                break;
+            case "confirm":
+                botDiv.remove();
+                renderConfirm(data);
+                break;
             case "success":
                 botDiv.className = "bot-message success-message";
                 botDiv.innerHTML = renderMarkdown(data.message);
@@ -722,11 +1014,19 @@ async function sendMessage() {
 
     setStreamingState(true);
 
+    // If a confirmation is pending, a typed reply (yes/no/haan/naa/anything)
+    // is sent WITH that context so the backend continues the same action.
+    const confirmCtx = pendingConfirm;
+    pendingConfirm = null;
+    const requestBody = confirmCtx
+        ? { message, context: confirmCtx }
+        : { message };
+
     try {
         const response = await fetch(CHAT_ENDPOINT, {
             method: "POST",
             headers: { "Content-Type": "application/json", "Authorization": "Bearer " + hrToken },
-            body: JSON.stringify({ message })
+            body: JSON.stringify(requestBody)
         });
 
         if (isAuthError(response)) {

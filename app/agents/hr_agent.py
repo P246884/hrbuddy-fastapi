@@ -89,7 +89,7 @@ def detect_action_intent(message: str):
         r"history|balance|remaining)\b", msg
     ))
     has_status_word = bool(re.search(
-        r"\b(approved|rejected|cancelled|canceled|requested|applied)\b",
+        r"\b(approved|rejected|cancelled|canceled|applied)\b",
         msg
     ))
 
@@ -97,7 +97,9 @@ def detect_action_intent(message: str):
     # leave", "apply sik", "leave laga do" all register. Users mistype; we still
     # understand. Anything fuzzy can't catch falls through to Ollama (STEP 6),
     # which reads intent even from messy phrasing.
-    LEAVE_NOUNS = ["leave", "leaves", "chutti", "chhutti", "chutee", "avkash"]
+    LEAVE_NOUNS = ["leave", "leaves", "chutti", "chhutti", "chutee", "avkash",
+                   "vacation", "vacations", "holiday", "holidays", "timeoff",
+                   "time off", "day off", "days off", "leef", "off"]
     LEAVE_TYPES = ["sick", "annual", "casual", "comp", "compoff", "carry",
                    "privilege", "earned", "maternity", "paternity"]
     has_leave = (
@@ -168,6 +170,54 @@ OUT_OF_SCOPE = {
 }
 
 
+_YES_WORDS = {
+    "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "okk", "confirm",
+    "confirmed", "proceed", "go", "haan", "ha", "han", "hanji", "haanji",
+    "theek", "thik", "kardo", "kar", "krdo", "karo", "bilkul", "yess", "yo",
+    "ji", "jee", "done", "ya",
+}
+_NO_WORDS = {
+    "no", "n", "nope", "nah", "naa", "na", "nahi", "mat", "cancel", "stop",
+    "abort", "chodo", "rehne", "nai", "dont", "never", "rukja", "ruko",
+}
+
+
+def _interpret_yes_no(reply):
+    """Classify a free-text reply to a confirmation as 'yes' / 'no' / 'unknown'."""
+    import re as _re
+    r = _re.sub(r"[^a-z\s]", " ", (reply or "").lower())
+    r = _re.sub(r"\s+", " ", r).strip()
+    if not r:
+        return "unknown"
+    toks = set(r.split())
+    phrases_yes = ("go ahead", "do it", "kar do", "theek hai", "thik hai",
+                   "yes please", "haan ji")
+    phrases_no = ("do not", "rehne do", "not now", "leave it", "mat karo")
+    if any(p in r for p in phrases_no):
+        return "no"
+    if any(p in r for p in phrases_yes):
+        return "yes"
+    has_yes = bool(toks & _YES_WORDS)
+    has_no = bool(toks & _NO_WORDS)
+    if has_no and not has_yes:
+        return "no"
+    if has_yes and not has_no:
+        return "yes"
+    return "unknown"
+
+
+def _coming_soon():
+    return (
+        "🚧 That's coming soon!\n\n"
+        "Right now I can help you with:\n"
+        "• 👤 Employees — profiles & directory\n"
+        "• 📊 Leave balances\n"
+        "• 📋 Leave history & insights\n"
+        "• ✅ Leave apply / approve / reject / cancel (single or bulk)\n\n"
+        "More modules will be available shortly! 🚀"
+    )
+
+
 def process_message(
     message: str,
     user: dict,
@@ -201,7 +251,94 @@ def process_message(
         return safe_redirect_message(), None
 
     # ----------------------------------
-    # STEP 1: PENDING ACTION CHECK
+    # STEP 0b: HOW-TO / GUIDANCE questions are help, not data lookups.
+    # "how do I approve a leave request" must NOT dump the user's leaves.
+    # ----------------------------------
+    import re as _re0
+    _ml = translated_message.lower()
+    if (_re0.search(r"\bhow (do|to|can|would|should) i\b", _ml)
+            or _re0.search(r"\bhow to\b", _ml)
+            or _re0.search(r"\b(guide|help) me (with|on|to)\b", _ml)
+            or _re0.search(r"what is the (procedure|process|step)", _ml)):
+        return (
+            "Here's how I work — just tell me what you need in plain language:\n"
+            "• 📊 \"What's my leave balance?\"\n"
+            "• 📋 \"Show my leave history\" / \"how many leaves did I take in June\"\n"
+            "• ✅ \"Approve harshal's leave\" or bulk: \"approve vikrant, reject purav, cancel harshal leaves\"\n"
+            "• 📝 \"Apply sick leave for tomorrow\"\n"
+            "• 👤 \"Show employees in Project\" / \"who is manager of purav\"\n\n"
+            "Go ahead and ask directly — I'll take it from there."
+        ), None
+
+    # ----------------------------------
+    # STEP 0c: cross-employee leave RANKING ("who took the most leave") is an
+    # analytics feature we don't support yet — answer gracefully, don't treat
+    # "maximum"/"most" as a person's name.
+    # ----------------------------------
+    if (_re0.search(r"\b(most|maximum|max|least|minimum|min|highest|lowest|top)\b", _ml)
+            and _re0.search(r"\bleave|leaves\b", _ml)
+            and _re0.search(r"\b(who|employee|employees|which|person|people|staff)\b", _ml)):
+        return (
+            "📊 Ranking employees by leave usage is coming soon!\n\n"
+            "Right now I can show one person at a time — try:\n"
+            "• \"how many leaves did <name> take in January\"\n"
+            "• \"<name>'s leave history\"\n"
+            "• \"show employees in <department>\""
+        ), None
+
+    # ----------------------------------
+    # STEP 0d: you can't approve/reject your OWN leave — that's your manager's
+    # job. (Cancelling your own leave IS allowed and falls through normally.)
+    # ----------------------------------
+    if (_re0.search(r"\b(approve|reject)\b", _ml)
+            and _re0.search(r"\bmy\b", _ml)
+            and _re0.search(r"\b(leave|leaves|vacation|request|holiday|time off)\b", _ml)):
+        return (
+            "You can't approve or reject your own leave — your manager handles that. "
+            "I can show your pending requests (\"show my pending leaves\") or apply a "
+            "new leave for you (\"apply sick leave for tomorrow\")."
+        ), None
+
+    # ----------------------------------
+    # STEP 1: PENDING CONFIRMATION (yes / no / haan / naa)
+    # If we previously asked the user to confirm something, their reply decides
+    # it — it is NOT treated as a brand-new command. Anything that isn't a
+    # clear yes/no falls through and is handled as a fresh message.
+    # ----------------------------------
+    from app.services.leave_action_executor import (
+        parse_bulk_actions, handle_bulk_action, confirm_bulk_response
+    )
+    if pending_context and pending_context.get("_confirm"):
+        verdict = _interpret_yes_no(translated_message)
+        if verdict == "yes":
+            if pending_context["_confirm"] == "bulk":
+                return handle_bulk_action(
+                    pending_context.get("items", []),
+                    pending_context.get("message", ""), user, token
+                )
+        elif verdict == "no":
+            return "Okay, cancelled — nothing was changed. 👍", None
+        else:
+            # Not a clear yes/no. If the reply is itself a NEW command, let it
+            # through; otherwise stay in the confirmation and ask again.
+            _is_new_cmd = bool(
+                parse_bulk_actions(translated_message)
+                or detect_action_intent(translated_message)
+            )
+            if not _is_new_cmd:
+                _d = parse_fast_intent(translated_message)
+                _is_new_cmd = bool(_d and _d.get("entity") in
+                                   ("leave", "leave_history", "employee"))
+            if not _is_new_cmd and pending_context["_confirm"] == "bulk":
+                return confirm_bulk_response(
+                    pending_context.get("items", []),
+                    pending_context.get("message", ""),
+                    prefix="Please reply yes or no. "
+                ), None
+            # else: fall through and handle as a fresh message
+
+    # ----------------------------------
+    # STEP 1b: PENDING ACTION (picker flows)
     # ----------------------------------
     if pending_context and pending_context.get("action"):
         return execute_leave_action(
@@ -215,15 +352,11 @@ def process_message(
     # ----------------------------------
     # STEP 2: FAST ACTION INTENT
     # ----------------------------------
-    # 2a) BULK / multi-person actions first: "approve vikrant, reject purav's,
-    #     cancel harshal leaves", "approve harshal and tanish leaves", etc.
-    from app.services.leave_action_executor import (
-        parse_bulk_actions, handle_bulk_action
-    )
+    # 2a) BULK / multi-person actions: confirm first, then run on "yes".
     bulk_items = parse_bulk_actions(translated_message)
     if bulk_items:
-        print("BULK ACTIONS:", bulk_items)
-        return handle_bulk_action(bulk_items, translated_message, user, token)
+        print("BULK ACTIONS (await confirm):", bulk_items)
+        return confirm_bulk_response(bulk_items, translated_message), None
 
     action = detect_action_intent(translated_message)
     if action:
@@ -250,6 +383,11 @@ def process_message(
 
         if decision.get("entity") == "analytics":
             return decision.get("answer"), None
+
+        # Scope is currently Leave + Employees only. Anything else (e.g.
+        # attendance) is acknowledged as coming soon rather than half-answered.
+        if decision.get("entity") not in ("leave", "leave_history", "employee"):
+            return _coming_soon(), None
 
         return execute(
             decision=decision,
@@ -314,6 +452,8 @@ def process_message(
 
     # Ollama ne read entity return kiya
     if decision and decision.get("entity"):
+        if decision.get("entity") not in ("leave", "leave_history", "employee"):
+            return _coming_soon(), None
         return execute(
             decision=decision,
             user=user,
