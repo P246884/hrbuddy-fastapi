@@ -8,10 +8,10 @@ from app.crm.entity_registry import ENTITY_REGISTRY
 from ollama import Client
 OLLAMA_HOST = "http://192.168.3.11:11434"
 client = Client(host=OLLAMA_HOST)
-# INTENT_MODEL = "qwen2.5:1.5b"
-# CHAT_MODEL = "qwen2.5:1.5b"
-INTENT_MODEL = "qwen2.5:3b"
-CHAT_MODEL = "qwen2.5:3b"
+INTENT_MODEL = "qwen2.5:1.5b"
+CHAT_MODEL = "qwen2.5:1.5b"
+# INTENT_MODEL = "qwen2.5:3b"
+# CHAT_MODEL = "qwen2.5:3b"
 
 
 
