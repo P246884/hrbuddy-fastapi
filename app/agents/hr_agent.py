@@ -271,20 +271,22 @@ def process_message(
         ), None
 
     # ----------------------------------
-    # STEP 0c: cross-employee leave RANKING ("who took the most leave") is an
-    # analytics feature we don't support yet — answer gracefully, don't treat
-    # "maximum"/"most" as a person's name.
+    # STEP 0c: COMPARISON / RANKING between named people
+    # "compare purav and harshal leaves this year", "who took the most leaves
+    # between X and Y", "compare experience of A and B". Needs >=2 names; an
+    # all-employee ranking (no names) is still coming soon.
     # ----------------------------------
-    if (_re0.search(r"\b(most|maximum|max|least|minimum|min|highest|lowest|top)\b", _ml)
-            and _re0.search(r"\bleave|leaves\b", _ml)
-            and _re0.search(r"\b(who|employee|employees|which|person|people|staff)\b", _ml)):
-        return (
-            "📊 Ranking employees by leave usage is coming soon!\n\n"
-            "Right now I can show one person at a time — try:\n"
-            "• \"how many leaves did <name> take in January\"\n"
-            "• \"<name>'s leave history\"\n"
-            "• \"show employees in <department>\""
-        ), None
+    from app.services.comparison import (is_comparison_query, build_comparison,
+                                          extract_comparison_names,
+                                          is_org_ranking_query, build_org_ranking)
+    if is_comparison_query(translated_message):
+        if len(extract_comparison_names(translated_message)) >= 2:
+            return build_comparison(translated_message, user, token), None
+        if is_org_ranking_query(translated_message):
+            return build_org_ranking(translated_message, user, token), None
+    elif is_org_ranking_query(translated_message) \
+            and len(extract_comparison_names(translated_message)) < 2:
+        return build_org_ranking(translated_message, user, token), None
 
     # ----------------------------------
     # STEP 0d: you can't approve/reject your OWN leave — that's your manager's

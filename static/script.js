@@ -676,6 +676,190 @@ function balanceGrid(items) {
     return grid;
 }
 
+function downloadBlob(filename, content, mime) {
+    const blob = new Blob([content], { type: mime || "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function svgToPng(svgEl, filename) {
+    const clone = svgEl.cloneNode(true);
+    const w = parseInt(svgEl.getAttribute("width")) || svgEl.clientWidth || 480;
+    const h = parseInt(svgEl.getAttribute("height")) || svgEl.clientHeight || 300;
+    const xml = new XMLSerializer().serializeToString(clone);
+    const svg64 = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(xml)));
+    const img = new Image();
+    img.onload = () => {
+        const scale = 2;
+        const canvas = document.createElement("canvas");
+        canvas.width = w * scale;
+        canvas.height = h * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.scale(scale, scale);
+        ctx.drawImage(img, 0, 0);
+        const a = document.createElement("a");
+        a.href = canvas.toDataURL("image/png");
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    };
+    img.src = svg64;
+}
+
+function comparisonCSV(data) {
+    const hasCount = (data.items || []).some((i) => i.count !== undefined);
+    const rows = [["Name", data.metric || "Value"].concat(hasCount ? ["Records"] : [])];
+    (data.items || []).forEach((it) => {
+        const v = it.value === null || it.value === undefined ? (it.note || "-") : it.value;
+        rows.push([it.name, v].concat(hasCount ? [it.count != null ? it.count : ""] : []));
+    });
+    return rows.map((r) => r.map((c) => '"' + String(c).replace(/"/g, '""') + '"').join(",")).join("\n");
+}
+
+function renderComparison(data) {
+    const items = (data.items || []);
+    const wrapper = makeMessage("bot-message");
+    wrapper.style.display = "block";
+
+    // bounded card so nothing overflows the chat bubble
+    const card = document.createElement("div");
+    card.style.border = "1px solid rgba(16,24,40,0.10)";
+    card.style.borderRadius = "12px";
+    card.style.padding = "14px 16px";
+    card.style.background = "rgba(127,127,127,0.04)";
+    card.style.maxWidth = "100%";
+    card.style.overflow = "hidden";
+    card.style.boxSizing = "border-box";
+
+    const head = document.createElement("div");
+    head.style.fontWeight = "600";
+    head.textContent = data.title || "Comparison";
+    card.appendChild(head);
+
+    const sub = document.createElement("div");
+    sub.style.fontSize = "12px";
+    sub.style.opacity = ".6";
+    sub.style.margin = "2px 0 12px";
+    sub.textContent = data.metric + (data.period ? "  ·  " + data.period : "");
+    card.appendChild(sub);
+
+    // --- responsive SVG bar chart (name on its own line; no clipping) ---
+    const valued = items.filter((i) => i.value !== null && i.value !== undefined).map((i) => Number(i.value));
+    const maxVal = Math.max(1, ...valued);
+    const hiVal = valued.length ? Math.max(...valued) : null;
+    const loVal = valued.length ? Math.min(...valued) : null;
+
+    const VBW = 480;
+    const nameH = 17, barH = 20, gap = 16, padT = 4, valueW = 60;
+    const barMaxW = VBW - 4 - valueW;       // leave room for the value text
+    const rowH = nameH + barH;
+    const H = padT + items.length * (rowH + gap);
+    const svgNS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + VBW + " " + H);
+    svg.setAttribute("width", "100%");
+    svg.setAttribute("height", H);
+    svg.setAttribute("preserveAspectRatio", "xMinYMin meet");
+    svg.style.display = "block";
+    svg.style.maxWidth = "100%";
+
+    const mkText = (x, y, t, opts) => {
+        opts = opts || {};
+        const el = document.createElementNS(svgNS, "text");
+        el.setAttribute("x", x); el.setAttribute("y", y);
+        el.setAttribute("font-size", opts.size || "12.5");
+        el.setAttribute("font-weight", opts.weight || "600");
+        el.setAttribute("fill", opts.fill || "#101828");
+        if (opts.anchor) el.setAttribute("text-anchor", opts.anchor);
+        if (opts.opacity) el.setAttribute("opacity", opts.opacity);
+        el.textContent = t;
+        return el;
+    };
+
+    items.forEach((it, idx) => {
+        const top = padT + idx * (rowH + gap);
+        const isNull = it.value === null || it.value === undefined;
+        const val = Number(it.value) || 0;
+        const bw = isNull ? 0 : Math.max(3, (val / maxVal) * barMaxW);
+
+        // name line (full width, no clipping) + most/least tag
+        let tag = "";
+        if (!isNull && hiVal !== loVal && val === hiVal) tag = "  ·  most";
+        else if (!isNull && hiVal !== loVal && val === loVal) tag = "  ·  least";
+        const nameEl = mkText(2, top + 12, it.name + tag, { size: "12.5", weight: "600" });
+        const titleEl = document.createElementNS(svgNS, "title");
+        titleEl.textContent = it.name;
+        nameEl.appendChild(titleEl);
+        svg.appendChild(nameEl);
+
+        const by = top + nameH;
+        const track = document.createElementNS(svgNS, "rect");
+        track.setAttribute("x", 2); track.setAttribute("y", by);
+        track.setAttribute("width", barMaxW); track.setAttribute("height", barH);
+        track.setAttribute("rx", "6"); track.setAttribute("fill", "rgba(16,24,40,0.06)");
+        svg.appendChild(track);
+
+        if (!isNull) {
+            const bar = document.createElementNS(svgNS, "rect");
+            bar.setAttribute("x", 2); bar.setAttribute("y", by);
+            bar.setAttribute("width", bw); bar.setAttribute("height", barH);
+            bar.setAttribute("rx", "6");
+            bar.setAttribute("fill", (val === hiVal && hiVal !== loVal)
+                ? "rgba(16,24,40,0.78)" : "rgba(16,24,40,0.42)");
+            svg.appendChild(bar);
+        }
+
+        const vtext = isNull ? (it.note || "—") : (it.value + " " + (data.unit || ""));
+        svg.appendChild(mkText(2 + (isNull ? 0 : bw) + 8, by + barH / 2 + 4, vtext,
+            { size: "11.5", weight: "700" }));
+    });
+    card.appendChild(svg);
+
+    if (data.summary) {
+        const sm = document.createElement("div");
+        sm.style.fontSize = "13px";
+        sm.style.marginTop = "10px";
+        sm.textContent = data.summary;
+        card.appendChild(sm);
+    }
+
+    // --- export buttons (inside the card) ---
+    const bar = document.createElement("div");
+    bar.style.display = "flex";
+    bar.style.flexWrap = "wrap";
+    bar.style.gap = "8px";
+    bar.style.marginTop = "12px";
+
+    const ICON_XLS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>';
+    const ICON_IMG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>';
+
+    const mkBtn = (html, fn) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.style.cssText = "display:inline-flex;align-items:center;font-size:12.5px;font-weight:600;padding:7px 12px;border:0.5px solid rgba(16,24,40,0.25);background:transparent;color:inherit;border-radius:8px;cursor:pointer;";
+        b.innerHTML = html;
+        b.addEventListener("click", fn);
+        return b;
+    };
+    bar.appendChild(mkBtn(ICON_XLS + "Excel (CSV)", () =>
+        downloadBlob("comparison.csv", comparisonCSV(data), "text/csv")));
+    bar.appendChild(mkBtn(ICON_IMG + "Image (PNG)", () => svgToPng(svg, "comparison.png")));
+    card.appendChild(bar);
+
+    wrapper.appendChild(card);
+    appendMessage(wrapper);
+    scrollToBottom();
+}
+
 function renderBalanceGroup(data) {
     const wrapper = makeMessage("bot-message");
     wrapper.style.display = "block";
@@ -920,9 +1104,107 @@ function renderList(data) {
 
     moreBtn.addEventListener("click", renderMore);
     wrapper.appendChild(moreBtn);
+
+    // --- export (CSV + PNG) for the whole list ---
+    const xbar = document.createElement("div");
+    xbar.style.display = "flex";
+    xbar.style.flexWrap = "wrap";
+    xbar.style.gap = "8px";
+    xbar.style.marginTop = "12px";
+    const ICON_XLS2 = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>';
+    const ICON_IMG2 = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>';
+    const xbtn = (html, fn) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.style.cssText = "display:inline-flex;align-items:center;font-size:12.5px;font-weight:600;padding:7px 12px;border:0.5px solid rgba(16,24,40,0.25);background:transparent;color:inherit;border-radius:8px;cursor:pointer;";
+        b.innerHTML = html;
+        b.addEventListener("click", fn);
+        return b;
+    };
+    const fname = (data.kind === "employee" ? "employees" : "leaves");
+    xbar.appendChild(xbtn(ICON_XLS2 + "Excel (CSV)", () =>
+        downloadBlob(fname + ".csv", listCSV(data), "text/csv")));
+    xbar.appendChild(xbtn(ICON_IMG2 + "Image (PNG)", () =>
+        tableToPng(data.intro || "List", listColumns(data), fname + ".png")));
+    wrapper.appendChild(xbar);
+
     appendMessage(wrapper);
     renderMore(); // first page
     unblockInput();
+}
+
+function listColumns(data) {
+    const items = data.items || [];
+    if (!items.length) return { header: [], rows: [] };
+    const fieldLabels = (items[0].fields || []).map((f) => f[0]);
+    const hasBadge = items.some((i) => i.badge);
+    const header = ["#", "Name"].concat(hasBadge ? ["Status"] : []).concat(fieldLabels);
+    const rows = items.map((it, i) => {
+        const fv = (it.fields || []).map((f) => (f[1] == null ? "" : String(f[1])));
+        return [String(i + 1), it.primary || ""].concat(hasBadge ? [it.badge || ""] : []).concat(fv);
+    });
+    return { header: header, rows: rows };
+}
+
+function listCSV(data) {
+    const c = listColumns(data);
+    if (!c.header.length) return "";
+    const esc = (v) => '"' + String(v).replace(/"/g, '""') + '"';
+    return [c.header].concat(c.rows).map((r) => r.map(esc).join(",")).join("\n");
+}
+
+function tableToPng(title, cols, filename) {
+    const header = cols.header || [], rows = cols.rows || [];
+    if (!header.length) return;
+    const cvs = document.createElement("canvas");
+    const ctx = cvs.getContext("2d");
+    const scale = 2, pad = 14, rowH = 30, headH = 36, titleH = 34, font = "13px sans-serif";
+    ctx.font = font;
+    const colW = header.map((h, i) => {
+        let w = ctx.measureText(String(h)).width;
+        rows.forEach((r) => { w = Math.max(w, ctx.measureText(String(r[i] || "")).width); });
+        return Math.min(Math.ceil(w) + 22, 240);
+    });
+    const tableW = colW.reduce((a, b) => a + b, 0);
+    const W = tableW + pad * 2;
+    const H = titleH + headH + rows.length * rowH + pad * 2;
+
+    cvs.width = W * scale; cvs.height = H * scale;
+    ctx.scale(scale, scale);
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, W, H);
+    ctx.textBaseline = "middle";
+
+    ctx.fillStyle = "#101828"; ctx.font = "600 15px sans-serif";
+    ctx.fillText(String(title), pad, pad + 12);
+
+    let y = pad + titleH;
+    ctx.font = "700 13px sans-serif"; ctx.fillStyle = "#101828";
+    let x = pad;
+    header.forEach((h, i) => { ctx.fillText(String(h), x + 6, y + headH / 2); x += colW[i]; });
+    ctx.strokeStyle = "rgba(16,24,40,0.25)"; ctx.beginPath();
+    ctx.moveTo(pad, y + headH); ctx.lineTo(pad + tableW, y + headH); ctx.stroke();
+    y += headH;
+
+    ctx.font = "13px sans-serif";
+    rows.forEach((r) => {
+        x = pad;
+        r.forEach((cell, i) => {
+            ctx.fillStyle = "#101828";
+            let txt = String(cell);
+            while (txt && ctx.measureText(txt).width > colW[i] - 12) txt = txt.slice(0, -1);
+            if (txt !== String(cell)) txt = txt.slice(0, -1) + "…";
+            ctx.fillText(txt, x + 6, y + rowH / 2);
+            x += colW[i];
+        });
+        ctx.strokeStyle = "rgba(16,24,40,0.08)"; ctx.beginPath();
+        ctx.moveTo(pad, y + rowH); ctx.lineTo(pad + tableW, y + rowH); ctx.stroke();
+        y += rowH;
+    });
+
+    const a = document.createElement("a");
+    a.href = cvs.toDataURL("image/png");
+    a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
 }
 
 function renderBotResponse(botDiv, data) {
@@ -955,6 +1237,10 @@ function renderBotResponse(botDiv, data) {
             case "balance_group":
                 botDiv.remove();
                 renderBalanceGroup(data);
+                break;
+            case "comparison":
+                botDiv.remove();
+                renderComparison(data);
                 break;
             case "profile":
                 botDiv.remove();
