@@ -6,7 +6,7 @@ from app.llm.intent_alias_registry import resolve_entity_from_query
 from app.llm.prompts import SYSTEM_PROMPT
 from app.crm.entity_registry import ENTITY_REGISTRY
 from ollama import Client
-OLLAMA_HOST = "http://192.168.3.11:11434"
+OLLAMA_HOST = "http://127.0.0.1:11434"
 client = Client(host=OLLAMA_HOST)
 INTENT_MODEL = "qwen2.5:1.5b"
 CHAT_MODEL = "qwen2.5:1.5b"
@@ -295,7 +295,7 @@ def extract_decision(message: str):
 
     try:
         print("PROMPT LENGTH:", len(SYSTEM_PROMPT))
-        response = ollama.chat(
+        response = client.chat(
             model=INTENT_MODEL,
             format="json",
             keep_alive="30m",
@@ -330,7 +330,7 @@ def chat_response(message: str):
         # stream (and must NOT re-type it with the cosmetic typewriter).
         yield "\x1fLIVE\x1f"
         try:
-            stream = ollama.chat(
+            stream = client.chat(
                 model=CHAT_MODEL,
                 stream=True,
                 keep_alive="30m",
@@ -338,22 +338,34 @@ def chat_response(message: str):
                     {
                         "role": "system",
                         "content": (
-                            "You are HRBuddy, an HRMS assistant. You ONLY help "
+                            "You are ENZO, an HRMS assistant. You ONLY help "
                             "with HR topics: employee details, leave balance, "
                             "leave history, and applying/approving/rejecting/"
                             "cancelling leaves. "
                             "If the user asks ANYTHING outside HR — jokes, "
                             "general chit-chat, coding, trivia, opinions, world "
-                            "facts, etc. — do NOT answer it. Politely reply that "
-                            "you can only assist with HR-related queries and give "
-                            "one or two example HR questions they can ask. "
-                            "Never tell jokes or discuss non-HR topics. "
-                            "Keep replies short and professional."
+                            "facts, etc. — do NOT answer it. Politely reply, in "
+                            "ONE short sentence, that you can only assist with HR "
+                            "queries. Do NOT make up or list any example "
+                            "questions yourself. Never tell jokes or discuss "
+                            "non-HR topics. Keep it short and professional. "
+                            # --- scope / coming-soon handling ---
+                            "If the user asks about ATTENDANCE, office hours, "
+                            "system/login hours, SUMMARY, dashboard, or overall "
+                            "reports, politely say that feature is coming soon. "
+                            "If they ask to compare DEPARTMENTS or ATTENDANCE "
+                            "(e.g. 'compare project and finance'), say you can "
+                            "compare employees by LEAVE or EXPERIENCE, but "
+                            "department/attendance comparison is not available "
+                            "yet. If the request is ambiguous (e.g. 'show "
+                            "balance', 'show details'), assume they mean their "
+                            "OWN leave balance / profile, or ask one short "
+                            "clarifying question."
                         )
                     },
                     {"role": "user", "content": message}
                 ],
-                options={"temperature": 0.4, "num_predict": 400}
+                options={"temperature": 0.3, "num_predict": 120}
             )
             for part in stream:
                 piece = part.get("message", {}).get("content", "")
@@ -361,6 +373,14 @@ def chat_response(message: str):
                     yield piece
         except Exception as ex:
             print("CHAT STREAM ERROR:", str(ex))
-            yield "Sorry, I couldn't generate a response right now."
+            yield "I can only help with HR-related queries."
+
+        # Curated, KNOWN-WORKING examples (users copy these, so they must run).
+        yield ("\n\nYou can ask me things like:\n"
+               "• \"What's my leave balance?\"\n"
+               "• \"Show my leave history\" / \"how many leaves did I take in June\"\n"
+               "• \"Show my profile\" / \"what's my experience\"\n"
+               "• \"Apply sick leave for tomorrow\"\n"
+               "• \"Compare Purav and Harshal leaves\"")
 
     return _gen()

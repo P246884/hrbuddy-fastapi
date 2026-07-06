@@ -29,12 +29,80 @@ _COMP_EXTRA_STOP = {
     "days", "day", "balance", "history", "info", "details", "profile",
     "between", "amongst", "among", "from", "of", "the", "their", "show",
     "me", "us", "out", "these", "those", "both",
+    # Hinglish ranking / question / grammar words — never a person's name
+    "sabse", "jyada", "zyada", "jada", "kam", "adhik", "kisne", "kis", "kaun",
+    "kon", "kaunsi", "konsi", "kitni", "kitne", "li", "liya", "liye", "ne",
+    "ya", "aur", "hai", "hain", "wale", "wala", "wali", "sab", "saare", "sare",
+    "most", "least", "more", "less", "fewer", "maximum", "minimum", "max",
+    "min", "highest", "lowest", "top", "bottom", "who", "which", "whom",
 }
 _STOP = NON_NAME_QUALIFIERS | _COMP_EXTRA_STOP
 
 # status codes (mirror entity_registry)
 _STATUS = {"requested": 1, "approved": 100010001,
            "cancelled": 100010003, "rejected": 100010004}
+
+
+def is_on_leave_query(message):
+    """'who is on leave', 'employees on leave in january', 'who's absent today'."""
+    m = clean_text(message)
+    return (bool(re.search(r"\b(on leave|on vacation|absent)\b", m))
+            and bool(re.search(r"\b(who|whos|employees?|people|staff|anyone|"
+                               r"which|list|everyone)\b", m)))
+
+
+def build_on_leave(message, user, token):
+    """Scan the org for approved leaves overlapping a date window (default:
+    today) and list who is on leave. HR/admin only."""
+    import datetime
+    if not (user.get("is_hr") or user.get("is_admin")):
+        return ("Viewing who's on leave across the org is available to HR only. "
+                "You can still check one person — e.g. \"show Purav's leaves next week\".")
+
+    fr, to = compute_date_range(message)
+    if not (fr and to):
+        today = datetime.date.today().isoformat()
+        fr = to = today
+    period = fr if fr == to else (fr + " to " + to)
+
+    emp_q = build_dynamic_query(entity_name="employee",
+                                filters={"target": "multiple"}, current_user=user)
+    edata = execute_crm_query(crm_query=emp_q, token=token, user=user)
+    emps = edata.get("data", []) if edata.get("success") else []
+    if not emps:
+        return "I couldn't load the employee list right now."
+
+    items = []
+    for e in emps[:500]:
+        guid = e.get("employee_guid")
+        if not guid:
+            continue
+        filters = {"target": "employee", "employee_guid": guid, "top": "50",
+                   "from_date": fr, "to_date": to,
+                   "status": "approved", "status_code": _STATUS["approved"]}
+        q = build_dynamic_query(entity_name="leave_history", filters=filters,
+                                current_user=user)
+        data = execute_crm_query(crm_query=q, token=token, user=user)
+        recs = data.get("data", []) if data.get("success") else []
+        for r in recs:
+            frm = (r.get("from_date", "") or "")[:10]
+            t = (r.get("to_date", "") or "")[:10]
+            dates = frm + ((" → " + t) if t and t != frm else "")
+            items.append({
+                "primary": (e.get("employee_name") or "Employee"),
+                "badge": "On leave",
+                "fields": [["Type", r.get("leave_type") or "-"],
+                           ["Dates", dates],
+                           ["Days", str(r.get("days") or "")]],
+            })
+
+    if not items:
+        return "✅ No one has approved leave for " + period + "."
+    return json.dumps({
+        "type": "list", "kind": "leave",
+        "intro": "On leave (" + period + ") — " + str(len(items)) + " record(s)",
+        "count": len(items), "page_size": 10, "items": items,
+    })
 
 
 def is_org_ranking_query(message):
@@ -54,7 +122,10 @@ def build_org_ranking(message, user, token):
     one query per person). Returns a 'comparison' JSON or a plain string."""
     m = clean_text(message)
     by_exp = bool(re.search(r"\b(experience|exp|experienced)\b", m))
-    want_min = bool(re.search(r"\b(least|minimum|min|lowest|fewest|kam)\b", m))
+    _has_most = bool(re.search(r"\b(most|maximum|max|highest|top|jyada|zyada|adhik)\b", m))
+    _has_min = bool(re.search(r"\b(least|minimum|min|lowest|fewest|kam)\b", m))
+    # "most/least" together (ambiguous) -> treat as MOST (the usual intent)
+    want_min = _has_min and not _has_most
     topn_m = re.search(r"\btop\s+(\d+)", m)
     topn = int(topn_m.group(1)) if topn_m else 5
     is_hr_admin = bool(user.get("is_hr") or user.get("is_admin"))
@@ -101,13 +172,11 @@ def build_org_ranking(message, user, token):
             rows.append((e.get("employee_name") or "Employee", v))
         metric, unit, period = "Experience (years)", "years", ""
     else:
-        if len(emps) > 200:
-            return ("There are too many employees (" + str(len(emps)) + ") to rank "
-                    "live right now. Narrow it down, e.g. \"who took the most leaves "
-                    "in <designation>\" or \"... in <department>\".")
         fr, to = compute_date_range(message)
         status_code = _STATUS["approved"]
-        for e in emps:
+        # full-org ranking: one leave lookup per employee (sequential). Sane
+        # upper bound only to avoid a pathological loop.
+        for e in emps[:500]:
             guid = e.get("employee_guid")
             if not guid:
                 continue
@@ -116,7 +185,37 @@ def build_org_ranking(message, user, token):
         metric, unit = "Leave days taken (approved)", "days"
         period = (fr + " to " + to) if fr and to else ""
 
-    rows.sort(key=lambda x: x[1], reverse=not want_min)
+    both = _has_most and _has_min
+    rows.sort(key=lambda x: x[1], reverse=True)  # highest first
+
+    if both and len(rows) >= 2:
+        n = topn if topn_m else 3
+        n = max(1, min(n, len(rows) // 2 or 1))
+        most_rows = rows[:n]
+        least_rows = [r for r in rows[-n:] if r not in most_rows]
+        combined = most_rows + least_rows          # already descending overall
+        items = []
+        for nm, v in combined:
+            nm = nm.title() if isinstance(nm, str) and nm.isupper() else nm
+            items.append({"name": nm, "value": _fmt(v)})
+        hi_nm = items[0]["name"]
+        hi_v = items[0]["value"]
+        lo_nm = items[-1]["name"]
+        lo_v = items[-1]["value"]
+        verb = "has" if by_exp else "took"
+        summary = (hi_nm + " " + verb + " the most (" + str(hi_v) + " " + unit
+                   + "), " + lo_nm + " the least (" + str(lo_v) + " " + unit + ").")
+        title = ("Most & least experienced" if by_exp else "Most & least leaves taken")
+        return json.dumps({
+            "type": "comparison",
+            "title": title + scope_note,
+            "metric": metric, "period": period, "unit": unit,
+            "items": items, "summary": summary,
+        })
+
+    # single end (most OR least)
+    if want_min:
+        rows.sort(key=lambda x: x[1])  # lowest first
     top = rows[:topn]
     items = []
     for nm, v in top:

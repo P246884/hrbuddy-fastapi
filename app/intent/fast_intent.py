@@ -460,6 +460,11 @@ NON_NAME_QUALIFIERS = {
     "very", "too", "again", "here", "there",
     # question words / quantity
     "how", "when", "where", "why", "whether",
+    # Hinglish grammar / domain fillers (never names)
+    "hai", "hain", "hei", "he", "tha", "thi", "the", "kitni", "kitne", "kitna",
+    "bachi", "bache", "bacha", "baki", "baaki", "book", "booking", "chutti",
+    "chahiye", "chaiye", "mujhe", "meri", "mera", "mere", "batao", "bata",
+    "dikhao", "dikha", "karo", "kardo", "krdo", "abhi",
     # HR domain
     "leave", "leaves", "leav", "chutti", "chhutti", "avkash",
     "sick", "annual", "casual", "comp", "compoff", "carry", "privilege",
@@ -509,6 +514,59 @@ NON_NAME_QUALIFIERS = {
     "recent", "total", "remaining", "pending", "me", "for", "be", "able",
     "myself", "kar", "krdo", "kardo", "dikhao", "batao", "do", "the",
 }
+
+
+# A bundled "not a name" vocabulary: common English words + Hindi function
+# words that regularly get mis-extracted as a person's name from leftover
+# tokens. This is a dictionary (one list, generalises) — not per-query tuning.
+_NOT_NAME_WORDS = {
+    # common english
+    "left", "old", "new", "personal", "account", "employment", "organization",
+    "organisation", "complete", "wise", "better", "best", "use", "used",
+    "remain", "remains", "sufficient", "consecutive", "currently", "current",
+    "planning", "applying", "applications", "application", "takers", "often",
+    "still", "enough", "available", "any", "some", "more", "less", "much",
+    "many", "number", "count", "total", "overall", "summary", "report",
+    "details", "detail", "data", "information", "info", "status", "record",
+    "records", "entry", "entries", "log", "logs", "activity", "transactions",
+    "mistake", "everything", "anything", "something", "nothing", "latest",
+    "previous", "past", "recent", "profile", "balance", "history", "leave",
+    "leaves", "vacation", "holiday", "off", "day", "days", "week", "month",
+    "year", "today", "tomorrow", "yesterday", "please", "kindly", "sure",
+    "okay", "yes", "no", "thanks", "hello", "hey", "team", "staff", "company",
+    "again", "here", "there", "this", "that", "those", "these",
+    # hindi / hinglish function words
+    "paas", "kaunsi", "konsi", "kaun", "kon", "maine", "meine", "jayegi",
+    "jayega", "hoga", "hogi", "kya", "kyaa", "jyada", "zyada", "kam", "adhik",
+    "bachi", "bache", "baki", "baaki", "bacha", "hai", "hain", "ho", "hoti",
+    "hota", "se", "ka", "ki", "ke", "ko", "liya", "liye", "li", "lu", "loon",
+    "mera", "meri", "mere", "mujhe", "hum", "humko", "sabse", "wale", "wala",
+    "wali", "sab", "saare", "sare", "kitni", "kitne", "kitna", "chahiye",
+    "chaiye", "abhi", "bhai", "yaar", "bata", "batao", "dikha", "karo",
+}
+
+# leave-domain words used to catch TYPOS ("leavs", "balnce", "pendng",
+# "compof", "annul", "anual", "sik", "casul") that slip in as fake names.
+_DOMAIN_FUZZY = [
+    "leave", "leaves", "balance", "pending", "approved", "rejected",
+    "cancelled", "annual", "casual", "sick", "compoff", "comp", "remaining",
+    "available", "history", "profile", "details", "request", "requests",
+    "attendance", "employee", "employees", "designation", "department",
+    "experience", "manager", "vacation", "holiday",
+]
+
+
+def _looks_like_junk_name_token(tok):
+    """True if a single extracted 'name' token is really a common/ domain /
+    typo word, not a person's name."""
+    low = tok.lower()
+    if len(low) < 3:
+        return True
+    if low in _NOT_NAME_WORDS or low in NON_NAME_QUALIFIERS:
+        return True
+    if difflib.get_close_matches(low, _DOMAIN_FUZZY, n=1, cutoff=0.82):
+        return True
+    return False
 
 
 def extract_employee_name(message, entity, target):
@@ -696,6 +754,118 @@ def parse_fast_intent(message: str):
             "filters": _base_filters(want_self_name=True), "answer": "",
         }
 
+    # "my manager / my department / ... / who is your manager / what is your
+    # department" -> the user's OWN profile, focused on the asked attribute.
+    # Full profile only when they ask for profile/details/info generally.
+    if re.search(r"\b(my|meri|mera|mere|your|ur|yours)\b", msg) and re.search(
+        r"\b(manager|department|dept|designation|experience|exp|profile|"
+        r"code|details|info|information|reporting|joining)\b", msg
+    ):
+        attr = ""
+        if re.search(r"\bmanager\b|\breporting\b", msg):
+            attr = "manager"
+        elif re.search(r"\bdepartment\b|\bdept\b", msg):
+            attr = "department"
+        elif re.search(r"\bdesignation\b", msg):
+            attr = "designation"
+        elif re.search(r"\bexperience\b|\bexp\b", msg):
+            attr = "experience"
+        elif re.search(r"\bcode\b", msg):
+            attr = "code"
+        # profile / details / info -> full profile (attr stays "")
+        return {
+            "entity": "employee", "operation": "read", "target": "self",
+            "filters": _base_filters(attribute=attr), "answer": "",
+        }
+
+    # "who is <name>" (a person lookup) -> that employee's profile. "who is my
+    # manager / who am i" are already handled above as self.
+    _whois = re.search(r"^\s*who\s+is\s+([a-z]+(?:\s+[a-z]+)?)\s*\??\s*$", msg)
+    if _whois:
+        _nm = " ".join(w for w in clean_text(_whois.group(1)).split()
+                       if w not in NON_NAME_QUALIFIERS).strip()
+        if _nm:
+            return {
+                "entity": "employee", "operation": "read", "target": "employee",
+                "filters": _base_filters(employee_name=title_name(_nm)), "answer": "",
+            }
+
+    # "show every employee / all employees / everyone / employee directory /
+    # everyone in the company / all staff records" = list the whole directory.
+    # One intent rule for the whole-org listing phrasings.
+    if (re.search(r"\b(every|all)\b.*\b(employee|employees|staff|people|"
+                  r"members?|records?)\b", msg)
+            or re.search(r"\b(everyone|everybody)\b", msg)
+            or re.search(r"\bemployee\s+(directory|list|master|records?)\b", msg)
+            or re.search(r"\b(directory|company)\b.*\bemployee", msg)
+            or "in the company" in msg or "in the organization" in msg
+            or re.search(r"\bshow\s+(the\s+)?(whole|entire)\s+(team|company|org)", msg)):
+        return {
+            "entity": "employee", "operation": "read", "target": "multiple",
+            "filters": _base_filters(), "answer": "",
+        }
+
+    # "show managers / list interns / developers / engineers ..." — a bare
+    # designation (job title) means "list employees with that designation".
+    # These are standard HR titles (a fixed domain vocabulary), so the CRM can
+    # resolve them; routing just needs entity=employee + target=multiple.
+    _DESIG = {
+        "manager": "manager", "managers": "manager", "intern": "intern",
+        "interns": "intern", "developer": "developer", "developers": "developer",
+        "engineer": "engineer", "engineers": "engineer", "consultant": "consultant",
+        "consultants": "consultant", "executive": "executive",
+        "executives": "executive", "lead": "lead", "leads": "lead",
+        "analyst": "analyst", "analysts": "analyst", "architect": "architect",
+        "architects": "architect", "designer": "designer", "designers": "designer",
+        "tester": "tester", "testers": "tester", "trainee": "trainee",
+        "trainees": "trainee", "member": "team member", "members": "team member",
+    }
+    _dwords = set(re.findall(r"[a-z]+", msg))
+    _DESIG_CANON = ["manager", "intern", "developer", "engineer", "consultant",
+                    "executive", "lead", "analyst", "architect", "designer",
+                    "tester", "trainee", "member"]
+    _desig_hit = next((_DESIG[w] for w in re.findall(r"[a-z]+", msg) if w in _DESIG), None)
+    if not _desig_hit:
+        for w in re.findall(r"[a-z]+", msg):
+            if len(w) >= 5:
+                mm = difflib.get_close_matches(w, _DESIG_CANON, n=1, cutoff=0.82)
+                if mm:
+                    _desig_hit = "team member" if mm[0] == "member" else mm[0]
+                    break
+    # not a designation-list when it's a leave/action context, or when
+    # "manager" is used relationally ("whose manager is X", "reports to X").
+    if _desig_hit and not re.search(r"\b(leave|leaves|apply|approve|reject|"
+                                    r"cancel|balance|history|my|mine|me)\b", msg) \
+            and not re.search(r"\bmanager\s+(is|of)\b", msg) \
+            and not re.search(r"\bwhose\s+manager\b", msg) \
+            and not re.search(r"\breport(s|ing)?\s+to\b", msg):
+        _sd = ""
+        _sm = re.search(r"\b(?:designation|role|position)\s+(?:is\s+)?([a-z]+)", msg)
+        return {
+            "entity": "employee", "operation": "read", "target": "multiple",
+            "filters": _base_filters(designation=_desig_hit), "answer": "",
+        }
+
+    # Department filters: "project department", "in sales department",
+    # "project wale employees", "employees from finance", "show sales team",
+    # "sales department dikhao".
+    _depm = (re.search(r"\b([a-z]+)\s+department\b", msg)
+             or re.search(r"\b([a-z]+)\s+dept\b", msg)
+             or re.search(r"\b([a-z]+)\s+departmnt\b", msg)
+             or re.search(r"\b([a-z]+)\s+deparment\b", msg)
+             or re.search(r"\bdepartment\s+(?:is\s+|of\s+)?([a-z]+)", msg)
+             or re.search(r"\b([a-z]+)\s+wale?\b", msg)
+             or re.search(r"\b([a-z]+)\s+wali\b", msg)
+             or re.search(r"\bemployees?\s+(?:from|in|under|of|working\s+in)\s+([a-z]+)", msg)
+             or re.search(r"\b(?:show|list|display)\s+([a-z]+)\s+team\b", msg))
+    if _depm:
+        _dep = _depm.group(1).strip()
+        if _dep and _dep not in ("the", "a", "an", "this", "that", "on", "my", "leave", "in"):
+            return {
+                "entity": "employee", "operation": "read", "target": "multiple",
+                "filters": _base_filters(department=_dep), "answer": "",
+            }
+
     # "show employees department wise / designation wise / by department"
     # = list everyone (grouping is a display concern). Handle deterministically
     # so the LLM doesn't hallucinate a bogus department filter.
@@ -705,6 +875,85 @@ def parse_fast_intent(message: str):
             "entity": "employee", "operation": "read", "target": "multiple",
             "filters": _base_filters(), "answer": "",
         }
+
+    # --- Employee-list synonyms & common typos ---
+    _EMP_FUZZY = ("employee", "employees", "emploee", "emploees", "employes",
+                  "emplyee", "employe", "staff", "workforce")
+    def _has_emp_word(m):
+        for t in re.findall(r"[a-z]+", m):
+            if t in ("workforce", "staff"):
+                return True
+            if len(t) >= 5 and difflib.get_close_matches(t, ["employee", "employees"], n=1, cutoff=0.8):
+                return True
+        return False
+    if (re.search(r"\b(workforce|company\s+directory|employee\s+master|"
+                  r"organization\s+employees|organisation\s+employees|all\s+users)\b", msg)
+            or (re.search(r"\b(show|list|display|view|give|fetch|retrieve|plz|pls|please|all|every|sab|saare|sare)\b", msg)
+                and _has_emp_word(msg) and not re.search(r"\b(my|mine|leave|leaves|balance|history|profile|attendance|of|for)\b", msg))):
+        return {
+            "entity": "employee", "operation": "read", "target": "multiple",
+            "filters": _base_filters(), "answer": "",
+        }
+
+    # --- Employee search: "find / locate / search / lookup <name>" ---
+    _srch = re.search(r"\b(find|locate|search|lookup|look up|get)\s+(?:employee\s+|staff\s+)?([a-z]+(?:\s+[a-z]+)?)\b", msg)
+    if _srch and not re.search(r"\b(leave|leaves|balance|history|attendance)\b", msg):
+        _cand = " ".join(w for w in _srch.group(2).split()
+                         if w not in NON_NAME_QUALIFIERS and w not in ("employee", "staff", "member", "details", "information", "info"))
+        if _cand:
+            return {
+                "entity": "employee", "operation": "read", "target": "employee",
+                "filters": _base_filters(employee_name=title_name(_cand)), "answer": "",
+            }
+
+    # --- Experience filter: "experienced / senior / junior / fresher / new
+    # employees", "experience filter / wise", experience-word + employees ---
+    _exp_word = next((t for t in re.findall(r"[a-z]+", msg)
+                      if len(t) >= 6 and difflib.get_close_matches(t, ["experience", "experienced"], n=1, cutoff=0.8)), None)
+    if ((_exp_word and re.search(r"\b(filter|wise|employees?|staff|show|list|dikhao)\b", msg))
+            or re.search(r"\b(experienced|senior|junior|fresher|freshers|new)\s+employees?\b", msg)
+            or re.search(r"\b(senior|experienced)\s+(staff|employees?)\b", msg)):
+        # a NUMERIC experience filter ("at least 3 years", "more than 5") must
+        # go to the proper extractor below, not this qualitative shortcut.
+        if not re.search(r"\bmy\b|\bmine\b", msg) and not re.search(r"\d", msg) \
+                and not re.search(r"\b(year|years|saal|yr|yrs)\b", msg):
+            return {
+                "entity": "employee", "operation": "read", "target": "multiple",
+                "filters": _base_filters(), "answer": "",
+            }
+
+    # --- Leave summary / analytics / overview (self OR a named employee) ---
+    # "leave summary", "leave analytics", "summary of my leaves" -> own summary.
+    # "summary of harshal leave", "harshal leave summary" -> that person's
+    # summary (HR-only; the executor enforces authorization). NOT attendance or
+    # org-wide (department/everyone) summaries — those stay coming-soon.
+    if (re.search(r"\bleave", msg) or re.search(r"\bchutti", msg)) and re.search(
+            r"\b(summary|analytics|overview|usage|insights?|statistics|stats|"
+            r"trend|analysis|summari)\b", msg):
+        if not re.search(r"\b(attendance|department|dept|team|organization|"
+                         r"company|everyone|everybody|all\s+employees|compare|"
+                         r"comparison|vs|versus|difference|between)\b", msg):
+            # a named person -> their summary; else the current user's.
+            _snm = ""
+            _mn = (re.search(r"summary\s+of\s+([a-z]+(?:\s+[a-z]+)?)", msg)
+                   or re.search(r"([a-z]+(?:\s+[a-z]+)?)\s+leave\s+(?:summary|analytics|overview|usage|report)", msg)
+                   or re.search(r"([a-z]+)'s\s+leave", msg))
+            if _mn:
+                _snm = " ".join(w for w in clean_text(_mn.group(1)).split()
+                                if w not in NON_NAME_QUALIFIERS
+                                and not _looks_like_junk_name_token(w)).strip()
+            if _snm:
+                return {
+                    "entity": "leave_history", "operation": "read",
+                    "target": "employee",
+                    "filters": _base_filters(summary=True,
+                                             employee_name=title_name(_snm)),
+                    "answer": "",
+                }
+            return {
+                "entity": "leave_history", "operation": "read", "target": "self",
+                "filters": _base_filters(summary=True), "answer": "",
+            }
 
     if should_use_llm(msg):
         return None
@@ -721,13 +970,50 @@ def parse_fast_intent(message: str):
                 or re.search(r"\btake\b\s+\d+", _fm)):
             entity = "leave"
 
-    if not entity:
-        # No explicit entity word, but an employee-attribute filter (experience
-        # / designation / department) implies an employee query — e.g.
-        # "who all have experience more than 5 years".
+    # Remaining-sense ("leaves left / remaining / available / balance / bachi")
+    # is a BALANCE question, distinct from taken-sense ("how many did I take").
+    # One semantic rule, not per-word patching.
+    if entity in ("leave_history", "leave", None):
+        _fm = clean_text(message)
+        _remaining = (re.search(r"\b(left|remaining|available|balance|bachi|"
+                                r"bache|baki|bacha|bचि)\b", _fm)
+                      or re.search(r"\bhow (many|much)\b.*\bleaves?\b.*"
+                                   r"\b(have|left|remaining|available)\b", _fm))
+        _taken = re.search(r"\b(taken|took|take|used|applied|apply|history|"
+                           r"previous|past|record|records|liya|li|history)\b", _fm)
+        if _remaining and not _taken:
+            entity = "leave"
+
+    # History synonyms: "leave log / records / transactions / activity /
+    # applications / entries / recent leaves" are the leave HISTORY, not balance.
+    if entity in ("leave", "leave_history", None):
+        _fm2 = clean_text(message)
+        if re.search(r"\bleave", _fm2) and re.search(
+            r"\b(log|logs|transaction|transactions|activity|activities|record|"
+            r"records|application|applications|entries|entry|previous|past|"
+            r"recent|historry|hstory)\b", _fm2) \
+                and not re.search(r"\b(balance|remaining|available|left|bachi|baki)\b", _fm2):
+            entity = "leave_history"
+
+    # "comp off" / "compoff" / "comp-off" is a LEAVE TYPE. A bare "comp off"
+    # request ("meri comp off batao", "vikrant comp off") means the leave
+    # balance for that type, even without the word balance/leave.
+    if entity in (None, "leave") and re.search(r"\bcomp\s*-?\s*off\b|\bcompoff\b", _clean := clean_text(message)):
+        if not re.search(r"\b(history|log|taken|applied|record|records)\b", _clean):
+            entity = "leave"
+
+    # "my data / show my data / my hr data" = the current user's profile.
+    if entity is None:
+        _cm = clean_text(message)
+        if re.search(r"\b(my|meri|mera|mere)\b.*\bdata\b", _cm) or _cm in ("show my data", "my data", "data"):
+            entity = "employee"
+            target = "self"
+
+    if entity is None:
         _m = clean_text(message)
         if extract_experience(_m) or re.search(
-            r"\b(designation|department|dept|experience|exp)\b", _m
+            r"\b(designation|department|dept|experience|exp|manager|profile|"
+            r"reporting|code|joining|email|phone)\b", _m
         ):
             entity = "employee"
         else:
@@ -835,6 +1121,27 @@ def parse_fast_intent(message: str):
     }
 
     filters.update(extract_type_filters(msg, entity))
+
+    # Balance query naming a SINGLE leave type ("comp off balance", "sick leave
+    # balance", "meri annual leave dikhao") -> show only that type. The executor
+    # filters the card to it and says "not available" if the user has no such
+    # balance. Canonical map keeps typos/synonyms together.
+    if entity == "leave":
+        _cm = clean_text(message)
+        _type_map = [
+            ("comp off", ["comp off", "compoff", "comp-off", "compensatory"]),
+            ("carry forward", ["carry forward", "carry-forward", "carryforward", "carry"]),
+            ("sick", ["sick"]),
+            ("annual", ["annual"]),
+            ("casual", ["casual"]),
+            ("earned", ["earned"]),
+            ("maternity", ["maternity"]),
+            ("paternity", ["paternity"]),
+        ]
+        for canon, aliases in _type_map:
+            if any(a in _cm for a in aliases):
+                filters["only_type"] = canon
+                break
     if experience:
         filters.update(experience)
 
@@ -871,13 +1178,29 @@ def parse_fast_intent(message: str):
         employee_name = potential_employee
 
     if employee_name:
+        # Final junk guard: a single-token "name" that is really a common word,
+        # a Hindi function word, or a domain typo (and has no real name context
+        # like "of X" / "X's" / "X ki") is NOT a person -> drop it and treat the
+        # query as self. Fixes "leaves left" -> name 'Left', "show personal
+        # details" -> name 'Personal', "meri leaves enough hain kya" -> 'Kya'.
+        _en = employee_name.strip()
+        _has_ctx = bool(re.search(
+            r"\b(of|for)\s+[a-z]|[a-z]'s\b|\b(ka|ki|ke)\b|\bemployee\s+[a-z0-9]",
+            msg))
+        if " " not in _en and not _has_ctx and _looks_like_junk_name_token(_en):
+            employee_name = ""
+            filters["employee_name"] = ""
+            if target == "employee":
+                target = "self"
+
+    if employee_name:
         filters["employee_name"] = employee_name
         target = "employee"
 
     # Safety net: a master (people) entity query with no usable filter, no
     # person, but leftover subset words (e.g. "related to harsh") -> defer to
     # Ollama, don't dump everyone. Registry-driven via is_master_entity.
-    if ENTITY_REGISTRY.get(entity, {}).get("is_master_entity"):
+    if ENTITY_REGISTRY.get(entity, {}).get("is_master_entity") and target != "self":
         has_filter = bool(
             starts_with or designation or department
             or employee_name or filters.get("employee_names")

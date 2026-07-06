@@ -133,11 +133,65 @@ def _maybe_paginate_list(decision, entity, target, records):
     is_history_list = (entity == "leave_history")
     if not (is_employee_list or is_history_list):
         return None
+
+    filters = decision.get("filters", {}) or {}
+
+    # Leave SUMMARY: aggregate the user's leaves (approved days by type +
+    # counts by status) and show it as the intro, followed by the full list.
+    # Runs BEFORE the insight-word short-circuit so "summary" still lists.
+    if is_history_list and filters.get("summary"):
+        cfg = ENTITY_REGISTRY.get("leave_history", {})
+        status_map = cfg.get("status_map", {}) or {}
+        by_type = {}
+        by_status = {}
+        total_approved = 0.0
+        for r in records:
+            try:
+                lbl = status_map.get(int(r.get("status")), str(r.get("status") or ""))
+            except (TypeError, ValueError):
+                lbl = str(r.get("status") or "")
+            lbl = (lbl or "Unknown").title()
+            by_status[lbl] = by_status.get(lbl, 0) + 1
+            try:
+                d = float(r.get("days") or 0)
+            except (TypeError, ValueError):
+                d = 0.0
+            if lbl.lower() == "approved":
+                t = str(r.get("leave_type") or "Leave")
+                by_type[t] = by_type.get(t, 0) + d
+                total_approved += d
+
+        def _fmt(n):
+            return str(int(n)) if float(n).is_integer() else str(n)
+
+        parts = []
+        if by_type:
+            parts.append(", ".join(f"{k} {_fmt(v)}" for k, v in
+                                   sorted(by_type.items(), key=lambda x: -x[1])))
+        status_bits = ", ".join(f"{v} {k.lower()}" for k, v in
+                                sorted(by_status.items(), key=lambda x: -x[1]))
+        _who = (filters.get("resolved_employee_name")
+                or filters.get("employee_name") or "").strip()
+        if _who.isupper():
+            _who = _who.title()
+        if target != "self" and _who:
+            lead = f"{_who}'s leave summary — {_who} has taken"
+        else:
+            lead = "Leave summary — you've taken"
+        intro = (f"{lead} {_fmt(total_approved)} approved "
+                 f"day(s)" + (f" ({parts[0]})" if parts else "") + ". "
+                 f"Requests: {status_bits}.")
+        items = [_list_item(entity, r) for r in records]
+        return json.dumps({
+            "type": "list", "kind": entity, "intro": intro,
+            "count": len(records), "page_size": _page_size(len(records)),
+            "items": items,
+        })
+
     # insight / count / month / balance queries keep their short answer
     if any(w in msg for w in _LIST_INSIGHT_WORDS):
         return None
 
-    filters = decision.get("filters", {}) or {}
     intro = _list_intro(entity, target, filters, len(records))
     items = [_list_item(entity, r) for r in records]
     return json.dumps({
@@ -170,6 +224,25 @@ def _balance_response(decision, target, records):
         except (TypeError, ValueError):
             bal = None
         items.append({"type": r.get("leave_type") or "Leave", "balance": bal})
+
+    # If the user asked for ONE specific leave type, show only that. If they
+    # have no such balance, say so instead of dumping every type.
+    only = (filters.get("only_type") or "").strip().lower()
+    if only:
+        matched = [it for it in items
+                   if only in str(it.get("type", "")).lower()
+                   or str(it.get("type", "")).lower() in only]
+        label = only.title()
+        who = "you" if target == "self" else _subject_label(filters, target, "").strip() or "they"
+        if not matched:
+            msg = (f"You don't have any {label} balance available."
+                   if target == "self"
+                   else f"{who} has no {label} balance available.")
+            return json.dumps({"type": "balance", "intro": msg, "items": []})
+        intro = (f"Here's your {label} balance." if target == "self"
+                 else f"Here's {who}'s {label} balance.")
+        return json.dumps({"type": "balance", "intro": intro, "items": matched})
+
     intro = "Here are " + _subject_label(filters, target, "leave balances") + "."
     return json.dumps({"type": "balance", "intro": intro, "items": items})
 
@@ -194,6 +267,28 @@ def _profile_response(decision, target, record):
         ("Manager", record.get("manager")),
     ]
     fields = [[k, str(v)] for k, v in raw if v not in (None, "", "None")]
+
+    # Focused attribute: "who is my manager", "what is my department" -> return
+    # just that one field, not the whole profile card.
+    attr = (filters.get("attribute") or "").strip().lower()
+    if attr:
+        label_map = {"manager": "Manager", "department": "Department",
+                     "designation": "Designation", "experience": "Experience",
+                     "code": "Code"}
+        want = label_map.get(attr)
+        one = [f for f in fields if f[0] == want]
+        who = "your" if target == "self" else (
+            (name.title() if name.isupper() else name) + "'s")
+        if one:
+            val = one[0][1]
+            answer = f"{who.capitalize() if target=='self' else who} {want.lower()} is {val}."
+            return json.dumps({"type": "profile", "intro": answer,
+                               "name": name, "fields": one})
+        # attribute not on record -> honest short answer, no full dump
+        return json.dumps({"type": "profile",
+                           "intro": f"{who.capitalize() if target=='self' else who} {attr} is not available.",
+                           "name": name, "fields": []})
+
     intro = ("Here's your profile." if target == "self"
              else "Here's " + (name.title() if name.isupper() else name) + "'s profile.")
     return json.dumps({"type": "profile", "intro": intro,

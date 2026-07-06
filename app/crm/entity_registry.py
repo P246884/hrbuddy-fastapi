@@ -42,7 +42,8 @@ ENTITY_REGISTRY = {
             "department": "bam_department",
             "designation": "bam_designation",
             "experience": "bam_totalexperienceinyears",
-            "manager": "bam_manager"
+            "manager": "bam_manager",
+            "date_of_birth": "bam_dateofbirth"
         },
         "searchable_fields": {
 
@@ -276,6 +277,38 @@ ENTITY_REGISTRY = {
                 810100002: "Office Hours",
             }
         },
+    },
+
+    # ----------------------------------------------------------------
+    # holiday — global (org-wide) list. NOT employee-scoped, so
+    # employee_lookup is None and the query builder adds no person filter.
+    # Date filters (this month / this year / upcoming) hit bam_startdate via
+    # date_filter_field. CONFIRM the PK/field names against your CRM.
+    # ----------------------------------------------------------------
+    "holiday": {
+        "aliases": [
+            "holiday", "holidays", "public holiday", "public holidays",
+            "gazetted holiday", "holiday list", "chutti list", "chuttiyan",
+        ],
+        "crm_entity": "bam_holiday",
+        "is_master_entity": False,
+        "primary_field": "bam_holidayid",     # CONFIRM exact PK name
+        "employee_lookup": None,               # global list, no person scope
+        "date_field": "bam_startdate",
+        "date_filter_field": "bam_startdate",
+        "fields": {
+            "name": "bam_name",
+            "from_date": "bam_startdate",
+            "to_date": "bam_enddate",
+            "days": "bam_noofdays",
+            "business_unit": "bam_businessunit",
+            "holiday_guid": "bam_holidayid",
+        },
+        "allowed_types": [],
+        "formatter": "generic",
+        "prompt_description": "company holidays / public holidays (with dates)",
+        "routing_signals": ["holiday", "holidays", "public holiday", "chutti list"],
+        "block_signals": [],
     }
 }
 

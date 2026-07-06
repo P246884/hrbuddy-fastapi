@@ -77,7 +77,8 @@ def detect_action_intent(message: str):
     # apply", "do no apply" -> NOT an action (user is explicitly refusing).
     if re.search(r"\b(do not|don'?\s?t|do no|donot|do nt|never|kindly do not|"
                  r"please don'?\s?t|please do not)\b(?:\s+\w+){0,3}\s+(apply|"
-                 r"approve|reject|cancel|appl|aply|apli|apprve|aprove|rejct|"
+                 r"approve|reject|cancel|book|booking|revoke|delete|remove|"
+                 r"withdraw|appl|aply|apli|apprve|aprove|rejct|"
                  r"cancl|cancle|lagao|laga|lgao|krdo|kardo)", msg):
         return None
 
@@ -92,6 +93,33 @@ def detect_action_intent(message: str):
         r"\b(approved|rejected|cancelled|canceled|applied)\b",
         msg
     ))
+
+    # "mark <X> leave as approved / rejected", "set ... to approved" is an
+    # ACTION even though it contains a status word. Catch it before the status
+    # guard blocks it.
+    if re.search(r"\b(mark|set|change)\b", msg) and not is_read_query:
+        if re.search(r"\b(as\s+)?approv", msg):
+            return "approve_leave"
+        if re.search(r"\b(as\s+)?reject", msg):
+            return "reject_leave"
+        if re.search(r"\b(as\s+)?cancel", msg):
+            return "cancel_leave"
+
+    # Explicit command phrasing that carries a status word but is really an
+    # ACTION: "... should be rejected/approved", "... reject it" (with an
+    # explicit reject/approve verb present) is a decision, not a history read.
+    if not is_read_query:
+        if re.search(r"should\s+be\s+approv|please\s+approv|\bapprov\w*\s+it\b", msg):
+            return "approve_leave"
+        if re.search(r"should\s+be\s+reject|please\s+reject|\breject\s+it\b|reject\s+instead", msg):
+            return "reject_leave"
+        if re.search(r"should\s+be\s+cancel|please\s+cancel|\bcancel\s+it\b", msg):
+            return "cancel_leave"
+
+    # "approval de do / approval chahiye" — an approval request even without the
+    # word "leave" (leave is implied in this HR bot).
+    if re.search(r"\bapproval\b", msg) and not is_read_query:
+        return "approve_leave"
 
     # Leave context = a leave noun OR a leave TYPE — both fuzzy, so "appl sick
     # leave", "apply sik", "leave laga do" all register. Users mistype; we still
@@ -108,27 +136,44 @@ def detect_action_intent(message: str):
         or _fuzzy_any(tokens, LEAVE_TYPES)
     )
 
+    # Cancel-intent phrases that must NOT be read as apply: "hata do/hatao"
+    # (= remove), "don't need … anymore", "no longer need", "nahi chahiye".
+    cancel_phrase = bool(re.search(
+        r"\bhata\s*do\b|\bhatao\b|\bhatado\b|\bhata\b|no longer need|"
+        r"don'?t need|nahi chahiye|nhi chahiye|not needed anymore|anymore",
+        msg)) and has_leave
+    if cancel_phrase and not is_read_query and not has_status_word:
+        return "cancel_leave"
+
     # Hinglish / multi-word apply phrasings (substring) + fuzzy English verb.
     APPLY_MULTI = (
         "laga do", "lagado", "laga", "lgao", "lagao", "le lu", "le loon",
         "leni", "krdo", "kardo", "kar do", "krni", "karni", "chahiye", "chaiye",
-        "want", "need",
+        "want", "need", "bhej do", "bhejo", "bhej", "request", "raise",
     )
-    has_apply = _fuzzy_any(tokens, ["apply", "applying"]) or any(v in msg for v in APPLY_MULTI)
+    has_apply = (_fuzzy_any(tokens, ["apply", "applying", "book", "booking",
+                                     "create", "raise", "submit", "mark"])
+                 or any(v in msg for v in APPLY_MULTI))
     other_action = _fuzzy_any(tokens, ["approve", "accept", "grant", "reject",
-                                       "decline", "deny", "cancel", "withdraw"])
+                                       "decline", "deny", "cancel", "withdraw",
+                                       "revoke", "delete", "remove"]) or cancel_phrase
 
     # apply wins over the read/balance path, but never for read/status queries.
     if has_apply and has_leave and not other_action and not is_read_query and not has_status_word:
         return "apply_leave"
 
-    # approve / reject / cancel — fuzzy verb + leave context, same guards.
-    if has_leave and not is_read_query and not has_status_word:
+    # approve / reject / cancel — fuzzy verb + leave context. Only a TERMINAL
+    # status word (approved/rejected/cancelled) blocks these — "applied"
+    # /"requested"/"pending" merely describe a live leave that CAN be actioned
+    # (e.g. "withdraw the leave I applied yesterday" -> cancel).
+    terminal_status = bool(re.search(
+        r"\b(approved|rejected|cancelled|canceled)\b", msg))
+    if has_leave and not is_read_query and not terminal_status:
         if _fuzzy_any(tokens, ["approve", "accept", "grant"]):
             return "approve_leave"
         if _fuzzy_any(tokens, ["reject", "decline", "deny"]):
             return "reject_leave"
-        if _fuzzy_any(tokens, ["cancel", "withdraw"]):
+        if _fuzzy_any(tokens, ["cancel", "withdraw", "revoke", "delete", "remove"]):
             return "cancel_leave"
 
     for action, patterns in ACTION_PATTERNS.items():
@@ -167,6 +212,11 @@ OUT_OF_SCOPE = {
     "overtime": "⏰ Overtime",
     "shift": "🔄 Shift",
     "document": "📁 Documents",
+    "attendance": "🕒 Attendance",
+    "office hours": "🕒 Office Hours",
+    "system hours": "🕒 System Hours",
+    "working hours": "🕒 Working Hours",
+    "dashboard": "📊 Dashboard",
 }
 
 
@@ -204,6 +254,32 @@ def _interpret_yes_no(reply):
     if has_yes and not has_no:
         return "yes"
     return "unknown"
+
+
+def _name_low_confidence(decision, original_message):
+    """A first-person query ('how many leaves do I have left', 'bachi hain
+    meri') should never resolve to a person's name pulled from a leftover
+    lowercase word ('Left', 'Hain'). If a name was extracted in a clearly
+    first-person sentence and that name never appears as a real (capitalised)
+    proper noun in the original text, treat the decision as low-confidence and
+    hand it to Ollama to infer the true intent."""
+    if not decision:
+        return False
+    filt = decision.get("filters") or {}
+    nm = (filt.get("employee_name") or "").strip()
+    if not nm or filt.get("employee_code"):
+        return False
+    if not _re_conf.search(r"\b(i|my|me|mine|myself|meri|mera|mere|meri|mujhe|"
+                           r"maine|hume|humko)\b", original_message or "", _re_conf.I):
+        return False
+    # keep it only if a name token shows up capitalised (a real proper noun)
+    for tok in nm.split():
+        if _re_conf.search(r"\b" + _re_conf.escape(tok) + r"\b", original_message or ""):
+            return False
+    return True
+
+
+import re as _re_conf
 
 
 def _coming_soon():
@@ -276,9 +352,25 @@ def process_message(
     # between X and Y", "compare experience of A and B". Needs >=2 names; an
     # all-employee ranking (no names) is still coming soon.
     # ----------------------------------
+    # ----------------------------------
+    # STEP 0e: cross-employee "who is on leave" — scan the org for the date
+    # window (default today) and list who has approved leave.
+    # ----------------------------------
     from app.services.comparison import (is_comparison_query, build_comparison,
                                           extract_comparison_names,
-                                          is_org_ranking_query, build_org_ranking)
+                                          is_org_ranking_query, build_org_ranking,
+                                          is_on_leave_query, build_on_leave)
+    if is_on_leave_query(translated_message):
+        return build_on_leave(translated_message, user, token), None
+
+    # STEP 0e-2: holidays (company list) and birthdays (from employee DOB).
+    from app.services.celebrations import (is_holiday_query, build_holidays,
+                                           is_birthday_query, build_birthdays)
+    if is_birthday_query(translated_message):
+        return build_birthdays(translated_message, user, token), None
+    if is_holiday_query(translated_message):
+        return build_holidays(translated_message, user, token), None
+
     if is_comparison_query(translated_message):
         if len(extract_comparison_names(translated_message)) >= 2:
             return build_comparison(translated_message, user, token), None
@@ -375,6 +467,13 @@ def process_message(
     # STEP 3: FAST INTENT (read queries)
     # ----------------------------------
     decision = parse_fast_intent(translated_message)
+
+    # If the fast path guessed a person's name in a first-person sentence with
+    # no real proper noun, it's almost certainly a junk name ("Left", "Hain").
+    # Don't answer confidently wrong — let Ollama infer the real intent below.
+    if _name_low_confidence(decision, message) or _name_low_confidence(decision, translated_message):
+        print("LOW-CONFIDENCE NAME -> deferring to Ollama:", decision)
+        decision = None
 
     if decision and decision.get("entity") == "smalltalk":
         return decision["answer"], None

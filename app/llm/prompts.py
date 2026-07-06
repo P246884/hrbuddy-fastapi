@@ -91,6 +91,11 @@ modules need no new examples; just pick the right entity from the list above):
   → entity="leave_history", target="employee", filters={employee_name: "harshal", top: "5"}
 - "show approved leaves this month"
   → entity="leave_history", filters={status: "approved", months: "1"}
+- "can i take 5 days leave" / "if i take 3 how many remain" / "meri 5 leave ho sakti hai"
+  → entity="leave", operation="read", target="self"
+  (ye feasibility hai — balance fetch karke jawab do, kitni bachegi bata do)
+- "will i run out of leave" / "is my balance sufficient"
+  → entity="leave", operation="read", target="self"
 
 For approve/reject/cancel — entity="leave_history".
 For apply — entity="leave".
