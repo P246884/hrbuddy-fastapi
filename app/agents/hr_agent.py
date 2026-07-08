@@ -73,6 +73,13 @@ def detect_action_intent(message: str):
     msg = clean_text(message)
     tokens = _action_tokens(msg)
 
+    # Question guard: "who is approving / who approves / who will approve my
+    # leave", "who is my approver/manager" is a QUESTION about the approver, not
+    # a command to approve/apply. Let the read path answer it (-> manager).
+    if re.search(r"\b(who|whom|kaun|kon|kisne|kis)\b", msg) and \
+       re.search(r"\bapprov|\bapprover\b|\breject|\brejecter\b|\bmanager\b|\breporting\b", msg):
+        return None
+
     # Negation guard: "do not apply leave", "don't apply", "I don't want to
     # apply", "do no apply" -> NOT an action (user is explicitly refusing).
     if re.search(r"\b(do not|don'?\s?t|do no|donot|do nt|never|kindly do not|"
@@ -134,6 +141,8 @@ def detect_action_intent(message: str):
         any(n in msg for n in LEAVE_NOUNS)
         or _fuzzy_any(tokens, LEAVE_NOUNS)
         or _fuzzy_any(tokens, LEAVE_TYPES)
+        # "apply half day tomorrow afternoon" implies a leave in this HR bot
+        or bool(re.search(r"\bhalf[\s-]?day\b|\baadh[ai]\b", msg))
     )
 
     # Cancel-intent phrases that must NOT be read as apply: "hata do/hatao"
@@ -160,6 +169,16 @@ def detect_action_intent(message: str):
 
     # apply wins over the read/balance path, but never for read/status queries.
     if has_apply and has_leave and not other_action and not is_read_query and not has_status_word:
+        return "apply_leave"
+
+    # bare "half day tomorrow afternoon" (no explicit verb) still means apply a
+    # half-day leave in this HR bot, as long as it isn't a read/status query.
+    if (re.search(r"\bhalf[\s-]?day\b|\baadh[ai]\b", msg)
+            and re.search(r"\btomorrow\b|\btoday\b|\byesterday\b|\bmorning\b|"
+                          r"\bafternoon\b|\bevening\b|\b\d{1,2}\b|\bmonday\b|"
+                          r"\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b|"
+                          r"\bsaturday\b|\bsunday\b", msg)
+            and not other_action and not is_read_query and not has_status_word):
         return "apply_leave"
 
     # approve / reject / cancel — fuzzy verb + leave context. Only a TERMINAL
@@ -347,6 +366,31 @@ def process_message(
         ), None
 
     # ----------------------------------
+    # STEP 0b-2: CHANGING / MODIFYING an existing leave's dates is not supported
+    # (there's no edit endpoint). Tell the user to cancel and re-apply instead.
+    # ----------------------------------
+    if (_re0.search(r"\b(change|chang|modif|edit|reschedul|re-?schedul|"
+                    r"postpone|postpon|prepone|prepon|move|shift|alter|amend|"
+                    r"extend|shorten|swap|badal|badl)\w*",
+                    _ml)
+            and _re0.search(r"\b(leave|leaves|chutti|vacation|holiday|"
+                            r"time off)\b", _ml)
+            and not _re0.search(r"\b(status|balance|history|show|list|kitni|"
+                                r"kitne)\b", _ml)):
+        import random as _rnd0
+        return (_rnd0.choice([
+            "I can't change the dates of an existing leave directly. Please "
+            "cancel that leave and apply a fresh one with the new dates.",
+            "Editing a leave's dates isn't supported — the way to do it is to "
+            "cancel the current leave and apply again for the new dates.",
+            "Leave dates can't be modified once applied. Just cancel it and "
+            "raise a new leave for the date you want.",
+            "There's no direct way to move a leave to another date. Cancel the "
+            "existing one, then apply a new leave for the new date.",
+        ]) + " For example: \"cancel my leave for 13th July\", then \"apply "
+             "annual leave for 14th July\"."), None
+
+    # ----------------------------------
     # STEP 0c: COMPARISON / RANKING between named people
     # "compare purav and harshal leaves this year", "who took the most leaves
     # between X and Y", "compare experience of A and B". Needs >=2 names; an
@@ -386,12 +430,19 @@ def process_message(
     # ----------------------------------
     if (_re0.search(r"\b(approve|reject)\b", _ml)
             and _re0.search(r"\bmy\b", _ml)
-            and _re0.search(r"\b(leave|leaves|vacation|request|holiday|time off)\b", _ml)):
-        return (
-            "You can't approve or reject your own leave — your manager handles that. "
-            "I can show your pending requests (\"show my pending leaves\") or apply a "
-            "new leave for you (\"apply sick leave for tomorrow\")."
-        ), None
+            and _re0.search(r"\b(leave|leaves|vacation|request|holiday|time off)\b", _ml)
+            # "who will approve my leave" is a QUESTION about the approver, not a
+            # request to self-approve -> let it fall through to the manager answer.
+            and not _re0.search(r"\b(who|whom|kaun|kon|kis|kisko)\b", _ml)):
+        import random as _rnd
+        return (_rnd.choice([
+            "You can't approve or reject your own leave — that's your manager's "
+            "call. Want me to show your pending requests, or apply a new leave?",
+            "Approving your own leave isn't allowed — your manager handles that. "
+            "I can pull up your pending leaves or file a new one if you like.",
+            "That one's up to your manager, not you — self-approval isn't allowed. "
+            "I can show what's pending or apply a fresh leave for you.",
+        ])), None
 
     # ----------------------------------
     # STEP 1: PENDING CONFIRMATION (yes / no / haan / naa)
@@ -400,7 +451,8 @@ def process_message(
     # clear yes/no falls through and is handled as a fresh message.
     # ----------------------------------
     from app.services.leave_action_executor import (
-        parse_bulk_actions, handle_bulk_action, confirm_bulk_response
+        parse_bulk_actions, handle_bulk_action, confirm_bulk_response,
+        _execute_leave_action_by_guid, _confirm_single_response
     )
     if pending_context and pending_context.get("_confirm"):
         verdict = _interpret_yes_no(translated_message)
@@ -409,6 +461,12 @@ def process_message(
                 return handle_bulk_action(
                     pending_context.get("items", []),
                     pending_context.get("message", ""), user, token
+                )
+            if pending_context["_confirm"] == "single":
+                return _execute_leave_action_by_guid(
+                    pending_context.get("action"),
+                    pending_context.get("leave_guid", ""),
+                    translated_message, user, token
                 )
         elif verdict == "no":
             return "Okay, cancelled — nothing was changed. 👍", None
@@ -429,6 +487,14 @@ def process_message(
                     pending_context.get("message", ""),
                     prefix="Please reply yes or no. "
                 ), None
+            if not _is_new_cmd and pending_context["_confirm"] == "single":
+                # keep it simple on re-ask — reuse the stored context as-is
+                import json as _json
+                return _json.dumps({
+                    "type": "confirm",
+                    "message": "Please reply yes or no — should I go ahead?",
+                    "context": pending_context,
+                }), None
             # else: fall through and handle as a fresh message
 
     # ----------------------------------

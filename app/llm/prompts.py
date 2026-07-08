@@ -96,6 +96,8 @@ modules need no new examples; just pick the right entity from the list above):
   (ye feasibility hai — balance fetch karke jawab do, kitni bachegi bata do)
 - "will i run out of leave" / "is my balance sufficient"
   → entity="leave", operation="read", target="self"
+  
+  
 
 For approve/reject/cancel — entity="leave_history".
 For apply — entity="leave".

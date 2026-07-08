@@ -482,6 +482,10 @@ NON_NAME_QUALIFIERS = {
     "salary", "payroll", "payslip", "reason", "half", "developer",
     "developers", "intern", "interns", "name", "named", "conflicts", "calendar",
     "type", "types", "forward", "off",
+    # time-of-day / half-day qualifiers (never names)
+    "morning", "afternoon", "evening", "noon", "forenoon", "midday", "night",
+    "subah", "shaam", "dopahar", "raat", "halfday", "aadha", "aadhi", "aadhe",
+    "beginning", "ending", "starting", "start", "end", "second", "first",
     # relative-date / Hinglish connectors
     "last", "recent", "latest", "previous", "past", "current", "next",
     "kal", "kl", "aaj", "aj", "ajj", "parso", "prso", "narso",
@@ -752,6 +756,18 @@ def parse_fast_intent(message: str):
         return {
             "entity": "employee", "operation": "read", "target": "self",
             "filters": _base_filters(want_self_name=True), "answer": "",
+        }
+
+    # "who is approving / who approves / who will approve my leave", "who is my
+    # approver", "who rejects my leave / who is my rejecter" -> the approver /
+    # rejecter IS the user's manager.
+    if re.search(r"\bapprov|\bapprover\b|\breject|\brejecter\b", msg) and (
+        re.search(r"\bmy\b|\bmeri\b|\bmera\b|\bmere\b", msg)
+        or re.search(r"\bwho\b|\bkaun\b|\bkon\b", msg)
+    ) and not re.search(r"\b(of|for)\s+[a-z]+", msg):
+        return {
+            "entity": "employee", "operation": "read", "target": "self",
+            "filters": _base_filters(attribute="manager"), "answer": "",
         }
 
     # "my manager / my department / ... / who is your manager / what is your

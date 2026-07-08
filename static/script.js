@@ -2,6 +2,36 @@ console.log("ENZO chat loaded");
 
 let hrToken = "";
 let pendingActionContext = null;
+let pendingAttachment = null;   // persists a chosen file across picker steps
+
+// Reusable, nicely-styled file-attach UI (used by the date & reason pickers).
+function attachmentRowHTML(id) {
+    return `
+        <div class="attach-row" style="margin-top:14px;">
+            <div style="font-size:13px;font-weight:600;color:#475467;margin-bottom:7px;display:flex;align-items:center;gap:6px;">
+                <span>📎</span> Attach a document
+                <span style="font-weight:400;color:#98a2b3;">(optional)</span>
+            </div>
+            <label for="${id}_file" id="${id}_drop"
+                   style="display:flex;align-items:center;gap:11px;padding:11px 13px;
+                          border:1.5px dashed #cbd5e1;border-radius:12px;background:#f8fafc;
+                          cursor:pointer;transition:border-color .15s,background .15s;">
+                <span id="${id}_ficon"
+                      style="flex:none;width:34px;height:34px;border-radius:9px;background:#eff6ff;
+                             display:flex;align-items:center;justify-content:center;font-size:16px;">⬆</span>
+                <span style="display:flex;flex-direction:column;min-width:0;">
+                    <span id="${id}_fname"
+                          style="font-size:13px;font-weight:600;color:#1e293b;white-space:nowrap;
+                                 overflow:hidden;text-overflow:ellipsis;">Choose a file</span>
+                    <span style="font-size:11px;color:#98a2b3;">PNG, JPG or PDF · up to 5 MB</span>
+                </span>
+            </label>
+            <input type="file" id="${id}_file"
+                   accept=".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf"
+                   onchange="handleLeaveAttachment('${id}', this)" style="display:none;">
+            <div id="${id}_fstatus" style="font-size:12px;margin-top:6px;"></div>
+        </div>`;
+}
 let pendingConfirm = null;
 let currentReader = null;
 let isStreaming = false;
@@ -282,26 +312,27 @@ function renderDatePicker(data) {
         <div class="halfday-row">
             <div class="halfday-toggle">
                 <input type="checkbox" id="halfDay_${pickerId}" onchange="toggleHalfDay('${pickerId}')">
-                <label for="halfDay_${pickerId}">Include half day</label>
+                <label for="halfDay_${pickerId}">Apply as half day</label>
             </div>
             <div id="halfDayOptions_${pickerId}" class="halfday-options">
                 <div class="halfday-group">
-                    <div class="halfday-label">Start date</div>
+                    <div class="halfday-label">Beginning From</div>
                     <div class="halfday-buttons">
                         <button type="button" class="half-option-btn selected" id="startFull_${pickerId}" onclick="selectStartHalf('${pickerId}', this)">Full Day</button>
-                        <button type="button" class="half-option-btn" id="startSecond_${pickerId}" onclick="selectStartHalf('${pickerId}', this)">Second Half</button>
+                        <button type="button" class="half-option-btn" id="startSecond_${pickerId}" onclick="selectStartHalf('${pickerId}', this)">Half Day</button>
                     </div>
                 </div>
                 <div class="halfday-group">
-                    <div class="halfday-label">End date</div>
+                    <div class="halfday-label">Ending On</div>
                     <div class="halfday-buttons">
                         <button type="button" class="half-option-btn selected" id="endFull_${pickerId}" onclick="selectEndHalf('${pickerId}', this)">Full Day</button>
-                        <button type="button" class="half-option-btn" id="endFirst_${pickerId}" onclick="selectEndHalf('${pickerId}', this)">First Half</button>
+                        <button type="button" class="half-option-btn" id="endFirst_${pickerId}" onclick="selectEndHalf('${pickerId}', this)">Half Day</button>
                     </div>
                 </div>
             </div>
         </div>
         <div id="dateErr_${pickerId}" class="date-error">End date cannot be before start date.</div>
+        ${attachmentRowHTML(pickerId)}
         <button type="button" class="confirm-btn" onclick="confirmDates('${pickerId}')">Confirm dates</button>
     `;
 
@@ -330,16 +361,88 @@ window.selectEndHalf = function (pickerId, button) {
 function renderReasonPicker(data) {
     const wrapper = makeMessage("bot-message action-card");
     const rid = "reasonInput_" + Date.now();
+    // If a file was already chosen at the date-picker step, don't show the
+    // upload UI again — just show a small "already attached" confirmation.
+    const alreadyAttached = !!(pendingAttachment && pendingAttachment.data);
+    const attachSection = alreadyAttached
+        ? `<div class="attach-row" style="margin-top:14px;display:flex;align-items:center;gap:9px;
+                  padding:10px 12px;border:1.5px solid #86efac;border-radius:12px;background:#f0fdf4;">
+               <span style="flex:none;width:30px;height:30px;border-radius:8px;background:#dcfce7;
+                     display:flex;align-items:center;justify-content:center;font-size:14px;">✓</span>
+               <span style="display:flex;flex-direction:column;min-width:0;">
+                   <span style="font-size:13px;font-weight:600;color:#047857;white-space:nowrap;
+                         overflow:hidden;text-overflow:ellipsis;">${escapeHtml(pendingAttachment.filename)}</span>
+                   <span style="font-size:11px;color:#65a30d;">Attachment added</span>
+               </span>
+           </div>`
+        : attachmentRowHTML(rid);
     wrapper.innerHTML = `
         <div class="action-title">${escapeHtml(data.message)}</div>
         <div class="reason-row">
             <textarea id="${rid}" placeholder="Enter reason (optional)..." rows="3"></textarea>
         </div>
+        ${attachSection}
         <button type="button" class="confirm-btn" onclick="confirmReason('${rid}')">Submit</button>
     `;
     appendMessage(wrapper);
     pendingActionContext = data.context;
     blockInput();
+}
+
+window.handleLeaveAttachment = function (rid, input) {
+    const statusEl = byId(rid + "_fstatus");
+    const nameEl = byId(rid + "_fname");
+    const iconEl = byId(rid + "_ficon");
+    const dropEl = byId(rid + "_drop");
+    const setStatus = (msg, ok) => {
+        if (statusEl) {
+            statusEl.textContent = msg;
+            statusEl.style.color = ok ? "#059669" : "#dc2626";
+        }
+    };
+    const resetLook = () => {
+        if (nameEl) { nameEl.textContent = "Choose a file"; nameEl.style.color = "#1e293b"; }
+        if (iconEl) { iconEl.textContent = "⬆"; iconEl.style.background = "#eff6ff"; }
+        if (dropEl) { dropEl.style.borderColor = "#cbd5e1"; dropEl.style.background = "#f8fafc"; }
+    };
+    pendingAttachment = null;
+    resetLook();
+
+    const file = input.files && input.files[0];
+    if (!file) { setStatus("", true); return; }
+
+    const okTypes = ["image/png", "image/jpeg", "application/pdf"];
+    const okExt = /\.(png|jpe?g|pdf)$/i.test(file.name);
+    if (!okTypes.includes(file.type) && !okExt) {
+        input.value = "";
+        return setStatus("Only PNG, JPG or PDF files are allowed.", false);
+    }
+    if (file.size > 5 * 1024 * 1024) {
+        input.value = "";
+        return setStatus("File is too large — the limit is 5 MB.", false);
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+        // strip the "data:...;base64," prefix — backend/CRM wants raw base64
+        const b64 = String(reader.result).split(",")[1] || "";
+        const mime = file.type || (/\.pdf$/i.test(file.name) ? "application/pdf"
+                     : /\.png$/i.test(file.name) ? "image/png" : "image/jpeg");
+        // persist across picker steps (date picker -> reason picker -> apply)
+        pendingAttachment = { filename: file.name, mimetype: mime, data: b64 };
+        if (nameEl) { nameEl.textContent = file.name; nameEl.style.color = "#047857"; }
+        if (iconEl) { iconEl.textContent = "✓"; iconEl.style.background = "#dcfce7"; }
+        if (dropEl) { dropEl.style.borderColor = "#86efac"; dropEl.style.background = "#f0fdf4"; }
+        setStatus("Attached · " + _prettySize(file.size), true);
+    };
+    reader.onerror = () => setStatus("Couldn't read that file — please try again.", false);
+    reader.readAsDataURL(file);
+};
+
+function _prettySize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 function renderLeavePicker(data) {
@@ -440,8 +543,8 @@ window.confirmDates = function (pickerId) {
         const startSecond = byId("startSecond_" + pickerId)?.classList.contains("selected");
         const endFirst = byId("endFirst_" + pickerId)?.classList.contains("selected");
 
-        if (from === to && startSecond && endFirst) {
-            return showError("Cannot select Second Half start and First Half end on the same date.");
+        if (startSecond && endFirst) {
+            return showError("A half-day start and a half-day end can't be one leave — there's no continuous full period. Apply separate leaves for each half day.");
         }
 
         if (startSecond) totalDays -= 0.5;
@@ -451,8 +554,14 @@ window.confirmDates = function (pickerId) {
         if (startSecond) halfInfo.push("start:second");
         if (endFirst) halfInfo.push("end:first");
         pendingActionContext.half_day_info = halfInfo.join(",");
+        // send the flags EXPLICITLY too, so there's no marker-translation
+        // ambiguity: Beginning From = Half -> beginning_from="half", etc.
+        pendingActionContext.beginning_from = startSecond ? "half" : "full";
+        pendingActionContext.ending_in = endFirst ? "half" : "full";
     } else {
         pendingActionContext.half_day_info = null;
+        pendingActionContext.beginning_from = "full";
+        pendingActionContext.ending_in = "full";
     }
 
     pendingActionContext.no_of_days = Math.max(totalDays, 0.5);
@@ -523,6 +632,10 @@ window.selectLeaveForAction = async function (leaveGuid, action, button) {
 };
 
 async function sendActionWithContext(context) {
+    // carry any file the user chose (at the date or reason picker) into apply
+    if (pendingAttachment && pendingAttachment.data) {
+        context.attachment = pendingAttachment;
+    }
     const leaveType = context.leave_type_name || "leave";
     const fromDate = context.from_date || "";
     const toDate = context.to_date || "";
@@ -568,6 +681,42 @@ async function sendActionWithContext(context) {
     scrollToBottom();
 }
 
+window.downloadAttachment = function (filename, mimetype, b64) {
+    try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: mimetype || "application/octet-stream" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename || "attachment";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (e) {
+        console.error("download failed", e);
+    }
+};
+
+function attachmentButton(att) {
+    // returns a styled "download" button element, or null
+    if (!att || !att.documentbody) return null;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = "⬇ " + (att.filename || "Download");
+    b.title = "Download attachment";
+    b.style.cssText =
+        "display:inline-flex;align-items:center;gap:6px;margin-top:8px;" +
+        "padding:6px 12px;border-radius:8px;border:1px solid rgba(37,99,235,0.35);" +
+        "background:rgba(37,99,235,0.08);color:#2563eb;font-size:13px;" +
+        "font-weight:600;cursor:pointer;";
+    b.addEventListener("click", () =>
+        window.downloadAttachment(att.filename, att.mimetype, att.documentbody));
+    return b;
+}
+
 function renderConfirm(data) {
     const wrapper = makeMessage("bot-message action-card");
     wrapper.style.display = "block";
@@ -577,10 +726,44 @@ function renderConfirm(data) {
     title.textContent = data.message;
     wrapper.appendChild(title);
 
+    if (data.detail) {
+        const card = document.createElement("div");
+        card.style.cssText =
+            "margin-top:10px;padding:12px 14px;border:1px solid rgba(16,24,40,0.1);" +
+            "border-radius:12px;background:linear-gradient(180deg,rgba(37,99,235,0.05),rgba(16,24,40,0.02));";
+
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:10px;flex-wrap:wrap;";
+
+        const lt = document.createElement("span");
+        lt.textContent = data.detail.leave_type || "Leave";
+        lt.style.cssText = "font-weight:700;font-size:15px;";
+
+        const when = document.createElement("span");
+        when.textContent = "📅 " + (data.detail.when || "");
+        when.style.cssText = "opacity:0.85;font-size:13px;";
+
+        const days = document.createElement("span");
+        days.textContent = data.detail.days || "";
+        days.style.cssText =
+            "font-size:12px;padding:3px 10px;border-radius:999px;" +
+            "background:rgba(37,99,235,0.14);color:#2563eb;font-weight:700;";
+
+        row.appendChild(lt);
+        row.appendChild(when);
+        if (data.detail.days) row.appendChild(days);
+        card.appendChild(row);
+
+        const dl = attachmentButton(data.detail.attachment);
+        if (dl) card.appendChild(dl);
+
+        wrapper.appendChild(card);
+    }
+
     const row = document.createElement("div");
     row.style.display = "flex";
     row.style.gap = "8px";
-    row.style.marginTop = "10px";
+    row.style.marginTop = "12px";
 
     const yes = document.createElement("button");
     yes.type = "button";
@@ -602,8 +785,6 @@ function renderConfirm(data) {
     wrapper.appendChild(row);
     appendMessage(wrapper);
 
-    // Store the pending confirmation. We deliberately DO NOT block the input
-    // box — the user may also just type "yes"/"no"/"haan"/"naa".
     pendingConfirm = data.context;
 }
 
@@ -1086,6 +1267,10 @@ function renderList(data) {
             });
             c.appendChild(grid);
         }
+        if (item.attachment && item.attachment.documentbody) {
+            const dl = attachmentButton(item.attachment);
+            if (dl) { dl.style.marginTop = "8px"; c.appendChild(dl); }
+        }
         return c;
     }
 
@@ -1280,6 +1465,7 @@ async function sendMessage() {
         alert("User token missing. Please login again.");
         return;
     }
+    pendingAttachment = null;   // fresh conversation turn -> drop any stale file
 
     appendMessage(makeMessage("user-message", message));
     input.value = "";
@@ -1419,4 +1605,4 @@ document.addEventListener("DOMContentLoaded", () => {
             sendMessage();
         }
     });
-});
+}); 

@@ -309,6 +309,32 @@ ENTITY_REGISTRY = {
         "prompt_description": "company holidays / public holidays (with dates)",
         "routing_signals": ["holiday", "holidays", "public holiday", "chutti list"],
         "block_signals": [],
+    },
+
+    # CRM Notes / attachments. Fetched by objectid (the regarding record —
+    # here a bam_leave). employee_lookup is reused as the objectid filter, so
+    # passing filters={"employee_guid": <leave_guid>} filters notes for that
+    # leave. documentbody is the base64 file body (used for download).
+    "annotation": {
+        "aliases": ["attachment", "attachments", "note", "notes", "document"],
+        "crm_entity": "annotation",
+        "is_master_entity": False,
+        "primary_field": "annotationid",
+        "employee_lookup": "objectid",         # filter notes by regarding record
+        "fields": {
+            "annotation_guid": "annotationid",
+            "filename": "filename",
+            "mimetype": "mimetype",
+            "subject": "subject",
+            "notetext": "notetext",
+            "documentbody": "documentbody",
+            "is_document": "isdocument",
+        },
+        "allowed_types": [],
+        "formatter": "generic",
+        "prompt_description": "leave attachments (notes)",
+        "routing_signals": [],
+        "block_signals": [],
     }
 }
 

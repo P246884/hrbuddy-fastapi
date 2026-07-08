@@ -66,11 +66,19 @@ def _list_item(entity, record):
             fields.append(["Dates", span])
         if record.get("days") not in (None, ""):
             fields.append(["Days", str(record.get("days"))])
-        return {
+        item = {
             "primary": str(record.get("leave_type") or "Leave"),
             "badge": status_lbl,
             "fields": fields,
         }
+        att = record.get("attachment")
+        if att and (att.get("documentbody") or att.get("filename")):
+            item["attachment"] = {
+                "filename": att.get("filename", "attachment"),
+                "mimetype": att.get("mimetype", "application/octet-stream"),
+                "documentbody": att.get("documentbody", ""),
+            }
+        return item
 
     # generic fallback
     fields = [[k, str(v)] for k, v in record.items() if v not in (None, "")][:4]
@@ -244,6 +252,35 @@ def _balance_response(decision, target, records):
         return json.dumps({"type": "balance", "intro": intro, "items": matched})
 
     intro = "Here are " + _subject_label(filters, target, "leave balances") + "."
+
+    # Leave balance is a LIVE figure (current remaining) — there is no stored
+    # per-year history and no way to project a future balance (leaves accrue /
+    # reset, future applications are unknown). So for ANY year that isn't the
+    # current one — or "last year" / "next year" — say so instead of passing off
+    # today's numbers as that year's balance.
+    import datetime as _dt
+    _msg = (decision.get("original_message", "") or "").lower()
+    _now = _dt.date.today().year
+    _yrs = [int(y) for y in re.findall(r"\b(20\d{2})\b", _msg)]
+    _other = [y for y in _yrs if y != _now]
+    _past_word = bool(re.search(r"\blast year\b|\bprevious year\b|\bpichle saal\b", _msg))
+    _future_word = bool(re.search(r"\bnext year\b|\bagle saal\b", _msg))
+    if _other or _past_word or _future_word:
+        _is_future = _future_word or any(y > _now for y in _other)
+        _yr = (str(next((y for y in _other), "")) or
+               ("next year" if _future_word else "last year"))
+        if _is_future:
+            intro = ("Leave balance is a live figure (your current remaining "
+                     f"leaves) — I can't project what it'll be in {_yr}, since "
+                     "that depends on future accrual, resets and any leaves you "
+                     "take.")
+        else:
+            intro = ("Leave balance is a live figure (your current remaining "
+                     f"leaves) — I don't have a stored balance for {_yr}. "
+                     "For the leaves you actually took then, ask e.g. "
+                     f"\"leave history {_yr}\".")
+        # don't show the current numbers as if they were that year's balance
+        return json.dumps({"type": "balance", "intro": intro, "items": []})
     return json.dumps({"type": "balance", "intro": intro, "items": items})
 
 
@@ -281,7 +318,35 @@ def _profile_response(decision, target, record):
             (name.title() if name.isupper() else name) + "'s")
         if one:
             val = one[0][1]
-            answer = f"{who.capitalize() if target=='self' else who} {want.lower()} is {val}."
+            subj = who.capitalize() if target == "self" else who
+            import random as _rnd
+            if attr == "manager":
+                answer = _rnd.choice([
+                    f"{subj} manager is {val}.",
+                    f"{val} is {who} reporting manager.",
+                    f"{subj} leaves go to {val} for approval.",
+                    f"That'd be {val} — {who} manager.",
+                ])
+            elif attr == "department":
+                answer = _rnd.choice([
+                    f"{subj} department is {val}.",
+                    f"{who.capitalize() if target=='self' else who} in the {val} department.",
+                    f"{val} — that's {who} department.",
+                ])
+            elif attr == "designation":
+                answer = _rnd.choice([
+                    f"{subj} designation is {val}.",
+                    f"{who.capitalize() if target=='self' else who} designated as {val}.",
+                    f"{val} — that's {who} role.",
+                ])
+            elif attr == "experience":
+                answer = _rnd.choice([
+                    f"{subj} experience is {val}.",
+                    f"{who.capitalize() if target=='self' else who} got {val} of experience.",
+                    f"{val} of experience on record for {who if target!='self' else 'you'}.",
+                ])
+            else:
+                answer = f"{subj} {want.lower()} is {val}."
             return json.dumps({"type": "profile", "intro": answer,
                                "name": name, "fields": one})
         # attribute not on record -> honest short answer, no full dump
@@ -880,6 +945,26 @@ def execute(
                     return None
             filtered = [r for r in records if _rec_month(r) in _mnums]
             records = filtered
+
+    # Attach any CRM note/attachment to each leave so the history cards can show
+    # a download link. Best-effort + capped (one light query per leave), never
+    # allowed to break the listing. Enrich most-recent-first so a freshly-applied
+    # leave is always covered even in a long history.
+    if entity == "leave_history" and records:
+        try:
+            from app.services.leave_action_executor import _attachment_for_leave
+            order = sorted(
+                range(len(records)),
+                key=lambda i: str(records[i].get("from_date") or ""),
+                reverse=True,
+            )
+            for i in order[:80]:
+                att = _attachment_for_leave(records[i].get("leave_guid"),
+                                            token, user, with_body=True)
+                if att:
+                    records[i]["attachment"] = att
+        except Exception as _e:
+            print("attachment enrich skipped:", _e)
 
     # 1) A specific question ("can I take 5?", "annual balance", "most used")
     #    deserves a short, computed sentence — not a card dump.

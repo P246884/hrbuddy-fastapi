@@ -5,7 +5,7 @@ import ollama
 
 from app.crm.entity_registry import ENTITY_REGISTRY, STATUS_MAPPING
 from ollama import Client
-OLLAMA_HOST = "http://192.168.3.11:11434"
+OLLAMA_HOST = "http://127.0.0.1:11434"
 client = Client(host=OLLAMA_HOST)
 # Build a global code->word status map from the registry (per-module status_map
 # entries) plus the global STATUS_MAPPING, so any module's status renders as a
@@ -755,7 +755,7 @@ def build_ai_response(
 
     try:
 
-        response = ollama.chat(
+        response = client.chat(
             model=RESPONSE_MODEL,
             messages=[
                 {
