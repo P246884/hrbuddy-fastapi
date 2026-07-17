@@ -517,6 +517,9 @@ NON_NAME_QUALIFIERS = {
     "able", "allowed", "afford", "mind", "around", "about", "summary",
     "recent", "total", "remaining", "pending", "me", "for", "be", "able",
     "myself", "kar", "krdo", "kardo", "dikhao", "batao", "do", "the",
+    # employee-lookup keywords — never a person's name
+    "id", "ids", "code", "codes", "employee", "emp", "staff", "number", "no",
+    "designation", "department", "dept",
 }
 
 
@@ -714,7 +717,8 @@ def parse_fast_intent(message: str):
     # the LLM, which is unreliable for them). ---
     def _base_filters(**over):
         f = {
-            "employee_name": "", "employee_names": [], "status": "", "type": "",
+            "employee_name": "", "employee_names": [], "employee_code": "",
+            "status": "", "type": "",
             "types": [], "days": "", "months": "", "top": "", "starts_with": "",
             "designation": "", "department": "", "from_date": "", "to_date": "",
             "dynamic_filters": [],
@@ -1209,6 +1213,42 @@ def parse_fast_intent(message: str):
             if target == "employee":
                 target = "self"
 
+    # ------------------------------------------------------------------
+    # EMPLOYEE CODE (id): "employee id 1214", "emp code 0731", "balance for
+    # 1214". Codes are 3-6 digits (may be zero-padded, e.g. 0015). When we
+    # find one, use it to look the person up and DROP any bogus name the
+    # extractor produced from the words "id"/"code"/"employee".
+    # ------------------------------------------------------------------
+    _code_hit = None
+    # strongest: an explicit id/code keyword right before the number
+    _mcode = re.search(r"\b(?:employee|emp|staff)?\s*(?:id|code|number|no)\.?\s*"
+                       r"#?\s*(\d{3,6})\b", msg)
+    if not _mcode:
+        # "employee 1214" / "emp 1214" (keyword then number, no id/code word)
+        _mcode = re.search(r"\b(?:employee|emp|staff)\s+(\d{3,6})\b", msg)
+    if not _mcode:
+        # bare number in a person-scoped read (balance/leave/profile/history)
+        # e.g. "leave balance for 1214", "show 1214 balance"
+        if entity in ("leave", "leave_history", "employee") and \
+                re.search(r"\b(balance|leave|leaves|profile|history|details|"
+                          r"attendance|info)\b", msg):
+            _bare = re.search(r"(?<![/\-\d])\b(\d{3,6})\b(?![/\-\d])", msg)
+            # don't grab a number that is clearly a year or a day-count
+            if _bare and not re.search(r"\b" + _bare.group(1) + r"\s*(days?|"
+                                       r"months?|years?)\b", msg) \
+                    and not (2000 <= int(_bare.group(1)) <= 2099):
+                _mcode = _bare
+    if _mcode:
+        _code_hit = _mcode.group(1)
+
+    if _code_hit:
+        filters["employee_code"] = _code_hit
+        # the name extractor may have produced "Id"/"Emp Code"/"Employee" from
+        # the surrounding words — throw it away; the code is authoritative.
+        employee_name = ""
+        filters["employee_name"] = ""
+        target = "employee"
+
     if employee_name:
         filters["employee_name"] = employee_name
         target = "employee"
@@ -1220,6 +1260,7 @@ def parse_fast_intent(message: str):
         has_filter = bool(
             starts_with or designation or department
             or employee_name or filters.get("employee_names")
+            or filters.get("employee_code")
             or experience
         )
         if not has_filter:

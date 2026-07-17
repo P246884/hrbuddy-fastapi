@@ -16,8 +16,7 @@
     --shadow: 0 24px 70px rgba(15, 35, 65, 0.16);
 }
 
-* { box-sizing: border-box;
-background: transparent !important; }
+* { box-sizing: border-box; }
 
 html,
 body { height: 100%; }

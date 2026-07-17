@@ -45,6 +45,20 @@ def chat(
 
     user_guid = user_context["user_guid"]
 
+    # --- TEMP DEBUG: confirm what roles/guid the token actually carries.
+    # Remove once role scoping is verified for manager vs HR logins.
+    print("ROLE DEBUG ::", {
+        "name": user_context["name"],
+        "is_hr": user_context["is_hr"],
+        "is_admin": user_context["is_admin"],
+        "is_manager": user_context["is_manager"],
+        "user_guid": user_guid,
+        "raw_IsHR": user.get("IsHR"),
+        "raw_IsManager": user.get("IsManager"),
+        "raw_UserGuid": user.get("UserGuid"),
+        "token_keys": list(user.keys()),
+    })
+
     # Continuation context comes ONLY from the client. Picker flows (type /
     # date / reason) send their context explicitly via request.context. A
     # freshly typed message carries no context, so it always starts fresh and

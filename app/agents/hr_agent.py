@@ -403,9 +403,34 @@ def process_message(
     from app.services.comparison import (is_comparison_query, build_comparison,
                                           extract_comparison_names,
                                           is_org_ranking_query, build_org_ranking,
-                                          is_on_leave_query, build_on_leave)
+                                          is_on_leave_query, build_on_leave,
+                                          is_org_pending_query, build_org_pending,
+                                          is_dept_leave_query, build_dept_leave,
+                                          is_group_balance_query, build_group_balance,
+                                          is_low_balance_query, build_low_balance)
     if is_on_leave_query(translated_message):
         return build_on_leave(translated_message, user, token), None
+
+    # Low balance ("who has less than N days left") — a filtered balance view.
+    # Checked before the full group-balance so a threshold query doesn't dump
+    # everyone's balance.
+    if is_low_balance_query(translated_message):
+        return build_low_balance(translated_message, user, token), None
+
+    # Group leave BALANCE: "leave balance for project department",
+    # "balance for designation Team Member". Beats the generic dept-leave view.
+    if is_group_balance_query(translated_message):
+        return build_group_balance(translated_message, user, token), None
+
+    # Org-wide / team pending requests: "show all pending leaves across the org",
+    # "pending leaves in finance department". Checked before the generic dept
+    # view because a pending+department query should still land here.
+    if is_org_pending_query(translated_message):
+        return build_org_pending(translated_message, user, token), None
+
+    # Department leave data (any status): "show leave data for finance department".
+    if is_dept_leave_query(translated_message):
+        return build_dept_leave(translated_message, user, token), None
 
     # STEP 0e-2: holidays (company list) and birthdays (from employee DOB).
     from app.services.celebrations import (is_holiday_query, build_holidays,

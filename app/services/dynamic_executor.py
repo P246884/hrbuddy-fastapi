@@ -538,6 +538,7 @@ def _resolve_target_employee(
 ):
     employee_names = filters.get("employee_names", [])
     employee_name = filters.get("employee_name", "")
+    employee_code = (filters.get("employee_code") or "").strip()
     if employee_names:
 
         resolved_employees = []
@@ -720,7 +721,7 @@ def _resolve_target_employee(
         target == "multiple"
     )
 
-    if not employee_name and not has_search_filter:
+    if not employee_name and not has_search_filter and not employee_code:
         if user.get("user_guid"):
             filters["employee_guid"] = user.get("user_guid")
             filters["resolved_employee_name"] = user.get("name", "")
@@ -728,8 +729,29 @@ def _resolve_target_employee(
             return None
         return "Unable to identify current user."
 
-    if not employee_name and has_search_filter:
+    if not employee_name and has_search_filter and not employee_code:
         # Search filter hai — employee_guid set mat karo
+        return None
+
+    # ------------------------------------------------------------------
+    # EMPLOYEE CODE (id) lookup — most reliable identifier. If the query gave
+    # a code ("employee id 1214", "balance for 1214"), resolve by code first.
+    # Auth for named/other employees is enforced later by can_read_entity.
+    # ------------------------------------------------------------------
+    if employee_code and not filters.get("employee_guid"):
+        code_result = resolve_employee(
+            employee_name="", token=token, user=user,
+            employee_code=employee_code
+        )
+        if not code_result.get("success"):
+            return "Unable to search employee."
+        code_records = code_result.get("data", [])
+        if not code_records:
+            return f"No employee found with ID {employee_code}."
+        emp0 = code_records[0]
+        filters["employee_guid"] = emp0.get("employee_guid")
+        filters["resolved_employee_name"] = emp0.get("employee_name")
+        filters["resolved_employee_code"] = emp0.get("employee_code")
         return None
 
     employee_result = resolve_employee(
