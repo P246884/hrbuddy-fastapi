@@ -186,16 +186,20 @@ window.startVoice = function () {
         return;
     }
 
+    const btn = byId("voiceBtn");
     const recognition = new SpeechRecognition();
     recognition.lang = "en-IN";
     recognition.interimResults = false;
     recognition.maxAlternatives = 1;
     recognition.start();
+    if (btn) btn.classList.add("recording");        // start -> red pulse
+
     recognition.onresult = (event) => {
         byId("messageInput").value = event.results[0][0].transcript;
         sendMessage();
     };
     recognition.onerror = (event) => console.log(event.error);
+    recognition.onend = () => { if (btn) btn.classList.remove("recording"); };  // stop -> back to blue
 };
 
 window.handleSendBtn = function () {

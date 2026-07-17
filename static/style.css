@@ -16,7 +16,8 @@
     --shadow: 0 24px 70px rgba(15, 35, 65, 0.16);
 }
 
-* { box-sizing: border-box; }
+* { box-sizing: border-box;
+background: transparent !important; }
 
 html,
 body { height: 100%; }
@@ -52,9 +53,12 @@ button { border: 0; }
     min-height: 100%;
     display: grid;
     place-items: center;
-    padding: 24px;
+   padding: 0;
 }
 
+@media (max-width: 720px) {
+    .app-shell { padding: 0; }
+}
 .chat-panel {
     width: min(100%, 980px);
     height: min(840px, calc(100vh - 48px));
