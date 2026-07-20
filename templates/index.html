@@ -3,30 +3,41 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ENZO | HR Assistant</title>
+    <title>ENZO | Support Agent</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<main class="app-shell" aria-label="ENZO HR assistant">
+<main class="app-shell" aria-label="ENZO support agent">
     <section class="chat-panel">
         <header class="chat-header">
             <div class="brand-lockup">
-                <div class="brand-mark" aria-hidden="true">E</div>
+                <div class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="4" y="8" width="16" height="12" rx="3"></rect>
+                        <circle cx="9" cy="14" r="1.4" fill="currentColor" stroke="none"></circle>
+                        <circle cx="15" cy="14" r="1.4" fill="currentColor" stroke="none"></circle>
+                        <path d="M12 8V4"></path>
+                        <circle cx="12" cy="3" r="1.2" fill="currentColor" stroke="none"></circle>
+                    </svg>
+                    <span class="avatar-status-dot" id="avatarStatusDot"></span>
+                </div>
                 <div>
                     <h1>ENZO</h1>
-                    <p>HR assistant</p>
+                    <p>Support Agent</p>
                 </div>
             </div>
-            <div class="status-pill" id="statusPill">
-                <span class="status-dot" id="statusDot" aria-hidden="true"></span>
-                <span id="statusText">Ready</span>
-            </div>
+            <span class="sr-only" id="statusText">Ready</span>
         </header>
 
         <div class="chat-box" id="chatBox" aria-live="polite" aria-label="Conversation">
             <div class="bot-message" id="greeting">
-                <span class="message-kicker">ENZO</span>
-                Hi 👋 I'm ENZO. Ask me about leave or employees.
+                <span class="chip-sparkle" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M9,8 L10.56,13.44 L16,15 L10.56,16.56 L9,22 L7.44,16.56 L2,15 L7.44,13.44 Z"></path>
+                        <path d="M17,4 L17.636,6.364 L20,7 L17.636,7.636 L17,10 L16.364,7.636 L14,7 L16.364,6.364 Z"></path>
+                    </svg>
+                </span>Hi 👋 Ask me anything about leave or employees.
             </div>
         </div>
 
@@ -35,23 +46,33 @@
             <input
                 type="text"
                 id="messageInput"
-                placeholder="Ask ENZO about leave or employees..."
+                placeholder="Ask ENZO"
                 autocomplete="off"
             >
 
-           <button id="voiceBtn" type="button" onclick="startVoice()" title="Voice input" aria-label="Voice input">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
-         stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-         aria-hidden="true">
-        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-        <line x1="12" y1="19" x2="12" y2="23"></line>
-        <line x1="8" y1="23" x2="16" y2="23"></line>
-    </svg>
-</button>
+            <!-- <button id="attachBtn" type="button" onclick="openUploadOverlay()" title="Attach a document" aria-label="Attach a document">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a1.5 1.5 0 0 1-2.12-2.12l8.49-8.48"></path>
+                </svg>
+            </button> -->
+
+            <button id="voiceBtn" type="button" onclick="startVoice()" title="Voice input" aria-label="Voice input">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                    <line x1="12" y1="19" x2="12" y2="23"></line>
+                    <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+            </button>
 
             <button id="sendBtn" type="button" onclick="handleSendBtn()" title="Send" aria-label="Send message">
-                <span aria-hidden="true">Send</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
             </button>
 
             <div class="input-blocker" id="inputBlocker" aria-live="assertive">
@@ -59,6 +80,28 @@
                 <button class="cancel-flow-btn" type="button" onclick="cancelFlow()">Cancel</button>
             </div>
         </form>
+
+        <!-- Voice "listening" overlay -->
+        <div class="voice-overlay" id="voiceOverlay">
+            <div class="voice-card">
+                <p>You can ask me everything</p>
+                <button type="button" class="voice-mic-btn" onclick="stopVoiceOverlay()"
+                        title="Listening — tap to stop" aria-label="Stop voice input">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- Upload-document overlay -->
+        <div class="upload-overlay" id="uploadOverlay">
+            <div class="upload-modal" id="uploadModal"></div>
+        </div>
     </section>
 </main>
 

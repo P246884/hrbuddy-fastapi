@@ -54,8 +54,6 @@ const STATUS_MESSAGES = {
 // AUTH / GREETING
 // ---------------------------------------------------------------------------
 function decodeUserName(token) {
-    // Read the name claim from the JWT payload (no verification needed here —
-    // we only use it to greet the user). Falls back to "" if anything fails.
     try {
         const part = (token || "").split(".")[1];
         if (!part) return "";
@@ -71,29 +69,32 @@ function decodeUserName(token) {
     }
 }
 
+// sparkle-chip greeting markup, matches the Figma reference (blue SVG
+// sparkle instead of the default-colored emoji)
+const SPARKLE_SVG =
+    `<span class="chip-sparkle" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M9,8 L10.56,13.44 L16,15 L10.56,16.56 L9,22 L7.44,16.56 L2,15 L7.44,13.44 Z"></path>
+            <path d="M17,4 L17.636,6.364 L20,7 L17.636,7.636 L17,10 L16.364,7.636 L14,7 L16.364,6.364 Z"></path>
+        </svg>
+     </span>`;
+
 function renderGreeting(name) {
     const greeting = byId("greeting");
     if (!greeting) return;
     const safe = name ? escapeHtml(name) : "";
     greeting.innerHTML =
-        `<span class="message-kicker">ENZO</span>` +
+        SPARKLE_SVG +
         (safe
-            ? `Hi ${safe} 👋 I'm ENZO, your HR assistant. Ask me about leave or employees.`
-            : `Hi 👋 I'm ENZO, your HR assistant. Ask me about leave or employees.`);
+            ? `Hi ${safe} 👋 Ask me anything about leave or employees.`
+            : `Hi 👋 Ask me anything about leave or employees.`);
 }
 
 function setStatus(state, text) {
-    const pill = byId("statusPill");
-    const dot = byId("statusDot");
+    const dot = byId("avatarStatusDot");
     const txt = byId("statusText");
     if (txt) txt.textContent = text;
-    if (state === "unauth") {
-        if (pill) { pill.style.background = "#FEE4E2"; pill.style.color = "#B42318"; }
-        if (dot) { dot.style.background = "#F04438"; }
-    } else {
-        if (pill) { pill.style.background = ""; pill.style.color = ""; }
-        if (dot) { dot.style.background = ""; }
-    }
+    if (dot) dot.classList.toggle("unauth", state === "unauth");
 }
 
 function setUnauthorized() {
@@ -113,7 +114,6 @@ window.addEventListener("message", (event) => {
         console.log("Token received");
         const name = (event.data.name || event.data.userName ||
             decodeUserName(hrToken) || "").toString().trim();
-        // greet with the first name for a clean, friendly line
         const first = name ? name.split(/\s+/)[0] : "";
         const pretty = first ? first.charAt(0).toUpperCase() + first.slice(1).toLowerCase() : "";
         renderGreeting(pretty);
@@ -142,11 +142,49 @@ function escapeHtml(value) {
         .replace(/'/g, "&#039;");
 }
 
+// full 12-hour timestamp ("02:12 PM") matching the Figma reference
+function formatTimeNow() {
+    const d = new Date();
+    let h = d.getHours();
+    const m = d.getMinutes();
+    const ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    const hh = String(h).padStart(2, "0");
+    const mm = String(m).padStart(2, "0");
+    return `${hh}:${mm} ${ampm}`;
+}
+
 function makeMessage(className, text = "") {
     const el = document.createElement("div");
     el.className = className;
     if (text) el.textContent = text;
     return el;
+}
+
+// Builds a user bubble wrapped with a centered timestamp above and a
+// "Read" receipt below, matching the Figma reference. Content is set once
+// at creation and never mutated afterward, so it's safe to wrap this way.
+function makeUserMessage(text) {
+    const wrap = document.createElement("div");
+    wrap.className = "user-message-wrap";
+
+    const time = document.createElement("div");
+    time.className = "msg-timestamp";
+    time.textContent = "Visitor " + formatTimeNow();
+    wrap.appendChild(time);
+
+    const bubble = document.createElement("div");
+    bubble.className = "user-message";
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+
+    const read = document.createElement("div");
+    read.className = "msg-read";
+    read.textContent = "Read";
+    wrap.appendChild(read);
+
+    return wrap;
 }
 
 function appendMessage(el) {
@@ -160,6 +198,7 @@ function blockInput() {
     byId("messageInput").disabled = true;
     byId("inputBlocker").classList.add("active");
     byId("voiceBtn").disabled = true;
+    byId("attachBtn").disabled = true;
 }
 
 function unblockInput() {
@@ -167,6 +206,7 @@ function unblockInput() {
     byId("messageInput").disabled = false;
     byId("inputBlocker").classList.remove("active");
     byId("voiceBtn").disabled = false;
+    byId("attachBtn").disabled = false;
     byId("messageInput").focus();
 }
 
@@ -179,6 +219,135 @@ window.cancelFlow = function () {
     appendMessage(cancelMsg);
 };
 
+// Top-level paperclip button: opens a drag/drop-style upload card (matches
+// the Figma reference) instead of the plain "attach later" note. The
+// resulting file is stored in the same pendingAttachment slot the date/reason
+// pickers already use, so it's ready whenever the person applies for leave.
+let topAttachPending = null;
+
+window.openUploadOverlay = function () {
+    if (isActionFlow) return;
+    renderUploadDefault();
+    byId("uploadOverlay").classList.add("active");
+};
+
+window.closeUploadOverlay = function () {
+    byId("uploadOverlay").classList.remove("active");
+};
+
+function renderUploadDefault() {
+    byId("uploadModal").innerHTML = `
+        <div class="upload-head">
+            <span>Upload Document</span>
+            <button type="button" class="upload-close-x" onclick="closeUploadOverlay()" aria-label="Close">✕</button>
+        </div>
+        <label for="topAttachFile" class="upload-dropzone">
+            <span class="cloud">⬆</span>
+            <span class="upload-dz-title">Drag &amp; drop your document here</span>
+            <span class="upload-dz-sub">or <u>browse files</u> from device</span>
+            <span class="upload-dz-hint">PNG, JPG or PDF · up to 5 MB</span>
+        </label>
+        <input type="file" id="topAttachFile"
+               accept=".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf"
+               style="display:none" onchange="handleTopAttachFile(this)">
+    `;
+}
+
+function renderUploadProgress(file) {
+    byId("uploadModal").innerHTML = `
+        <div class="upload-head">
+            <span>Uploading...</span>
+            <span class="upload-badge">1 of 1</span>
+        </div>
+        <div class="upload-progress-box">
+            <span class="upload-spin" aria-hidden="true"></span>
+            <span>Processing your attachment...</span>
+        </div>
+        <div class="upload-file-row">
+            <span class="upload-file-icon">📄</span>
+            <div class="upload-file-meta">
+                <div class="upload-file-name">${escapeHtml(file.name)}</div>
+                <div class="upload-file-sub">${_prettySize(file.size)}</div>
+            </div>
+        </div>
+    `;
+}
+
+function renderUploadSuccess(file) {
+    byId("uploadModal").innerHTML = `
+        <div class="upload-head">
+            <span>Success</span>
+            <span class="upload-badge">✓</span>
+        </div>
+        <div class="upload-success-box">
+            <span class="upload-success-circle">✓</span>
+            <span>File uploaded successfully</span>
+        </div>
+        <div class="upload-file-row success">
+            <span class="upload-file-icon">📄</span>
+            <div class="upload-file-meta">
+                <div class="upload-file-name">${escapeHtml(file.name)}</div>
+                <div class="upload-file-sub">${_prettySize(file.size)}</div>
+            </div>
+            <button type="button" class="upload-remove" onclick="cancelTopAttach()" title="Remove" aria-label="Remove file">🗑</button>
+        </div>
+        <button type="button" class="upload-continue-btn" onclick="confirmTopAttach()">Continue</button>
+    `;
+}
+
+window.handleTopAttachFile = function (input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+
+    const okTypes = ["image/png", "image/jpeg", "application/pdf"];
+    const okExt = /\.(png|jpe?g|pdf)$/i.test(file.name);
+    if (!okTypes.includes(file.type) && !okExt) {
+        alert("Only PNG, JPG or PDF files are allowed.");
+        return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+        alert("File is too large — the limit is 5 MB.");
+        return;
+    }
+
+    renderUploadProgress(file);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+        const b64 = String(reader.result).split(",")[1] || "";
+        const mime = file.type || (/\.pdf$/i.test(file.name) ? "application/pdf"
+                     : /\.png$/i.test(file.name) ? "image/png" : "image/jpeg");
+        topAttachPending = { filename: file.name, mimetype: mime, data: b64 };
+        // brief pause so the "processing" state is actually visible
+        setTimeout(() => renderUploadSuccess(file), 500);
+    };
+    reader.onerror = () => {
+        alert("Couldn't read that file — please try again.");
+        renderUploadDefault();
+    };
+    reader.readAsDataURL(file);
+};
+
+window.cancelTopAttach = function () {
+    topAttachPending = null;
+    renderUploadDefault();
+};
+
+window.confirmTopAttach = function () {
+    if (topAttachPending) {
+        pendingAttachment = topAttachPending;
+        const note = makeMessage("bot-message",
+            "📎 " + topAttachPending.filename + " attached — I'll include it when you apply for leave.");
+        note.style.color = "#667085";
+        note.style.fontStyle = "italic";
+        appendMessage(note);
+    }
+    topAttachPending = null;
+    closeUploadOverlay();
+};
+
+let currentRecognition = null;
+
 window.startVoice = function () {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -187,19 +356,39 @@ window.startVoice = function () {
     }
 
     const btn = byId("voiceBtn");
+    const overlay = byId("voiceOverlay");
     const recognition = new SpeechRecognition();
     recognition.lang = "en-IN";
     recognition.interimResults = false;
     recognition.maxAlternatives = 1;
     recognition.start();
-    if (btn) btn.classList.add("recording");        // start -> red pulse
+    currentRecognition = recognition;
+    if (btn) btn.classList.add("recording");
+    if (overlay) overlay.classList.add("active");
 
     recognition.onresult = (event) => {
         byId("messageInput").value = event.results[0][0].transcript;
+        if (overlay) overlay.classList.remove("active");
         sendMessage();
     };
-    recognition.onerror = (event) => console.log(event.error);
-    recognition.onend = () => { if (btn) btn.classList.remove("recording"); };  // stop -> back to blue
+    recognition.onerror = (event) => {
+        console.log(event.error);
+        if (overlay) overlay.classList.remove("active");
+    };
+    recognition.onend = () => {
+        if (btn) btn.classList.remove("recording");
+        if (overlay) overlay.classList.remove("active");
+        currentRecognition = null;
+    };
+};
+
+// Tapping the big mic in the listening overlay stops recognition early.
+window.stopVoiceOverlay = function () {
+    if (currentRecognition) {
+        try { currentRecognition.stop(); } catch (e) { /* already stopped */ }
+    }
+    const overlay = byId("voiceOverlay");
+    if (overlay) overlay.classList.remove("active");
 };
 
 window.handleSendBtn = function () {
@@ -207,10 +396,20 @@ window.handleSendBtn = function () {
     else sendMessage();
 };
 
+// Icon swap (send <-> stop) instead of textContent, so the SVG isn't wiped.
 function setStreamingState(streaming) {
     isStreaming = streaming;
     const button = byId("sendBtn");
-    button.textContent = streaming ? "Stop" : "Send";
+    button.innerHTML = streaming
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+               <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+           </svg>`
+        : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+               <line x1="22" y1="2" x2="11" y2="13"></line>
+               <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+           </svg>`;
     button.classList.toggle("streaming", streaming);
     button.title = streaming ? "Stop" : "Send";
     button.setAttribute("aria-label", streaming ? "Stop response" : "Send message");
@@ -235,10 +434,8 @@ function renderMarkdown(text) {
     return output;
 }
 
-// Cosmetic typewriter: paint text progressively (word-by-word) for a "typing"
-// feel on instant/structured responses. Respects Stop via getStopped().
 async function typewriterRender(botDiv, text, getStopped) {
-    const words = text.split(/(\s+)/); // keep whitespace as tokens
+    const words = text.split(/(\s+)/);
     let shown = "";
     for (let i = 0; i < words.length; i++) {
         if (getStopped && getStopped()) {
@@ -365,8 +562,6 @@ window.selectEndHalf = function (pickerId, button) {
 function renderReasonPicker(data) {
     const wrapper = makeMessage("bot-message action-card");
     const rid = "reasonInput_" + Date.now();
-    // If a file was already chosen at the date-picker step, don't show the
-    // upload UI again — just show a small "already attached" confirmation.
     const alreadyAttached = !!(pendingAttachment && pendingAttachment.data);
     const attachSection = alreadyAttached
         ? `<div class="attach-row" style="margin-top:14px;display:flex;align-items:center;gap:9px;
@@ -428,11 +623,9 @@ window.handleLeaveAttachment = function (rid, input) {
 
     const reader = new FileReader();
     reader.onload = () => {
-        // strip the "data:...;base64," prefix — backend/CRM wants raw base64
         const b64 = String(reader.result).split(",")[1] || "";
         const mime = file.type || (/\.pdf$/i.test(file.name) ? "application/pdf"
                      : /\.png$/i.test(file.name) ? "image/png" : "image/jpeg");
-        // persist across picker steps (date picker -> reason picker -> apply)
         pendingAttachment = { filename: file.name, mimetype: mime, data: b64 };
         if (nameEl) { nameEl.textContent = file.name; nameEl.style.color = "#047857"; }
         if (iconEl) { iconEl.textContent = "✓"; iconEl.style.background = "#dcfce7"; }
@@ -539,8 +732,6 @@ window.confirmDates = function (pickerId) {
     pendingActionContext.from_date = from;
     pendingActionContext.to_date = to;
 
-    // NOTE: this is a rough preview only. The backend recomputes the real
-    // chargeable days (it excludes weekends + public holidays).
     let totalDays = countWorkingDaysPreview(from, to);
 
     if (isHalf) {
@@ -558,8 +749,6 @@ window.confirmDates = function (pickerId) {
         if (startSecond) halfInfo.push("start:second");
         if (endFirst) halfInfo.push("end:first");
         pendingActionContext.half_day_info = halfInfo.join(",");
-        // send the flags EXPLICITLY too, so there's no marker-translation
-        // ambiguity: Beginning From = Half -> beginning_from="half", etc.
         pendingActionContext.beginning_from = startSecond ? "half" : "full";
         pendingActionContext.ending_in = endFirst ? "half" : "full";
     } else {
@@ -572,8 +761,6 @@ window.confirmDates = function (pickerId) {
     sendActionWithContext(pendingActionContext);
 };
 
-// Preview-only working-day count (excludes Sat/Sun). Holidays are applied by
-// the backend, so the confirmed total may be a little lower than this preview.
 function countWorkingDaysPreview(from, to) {
     const start = new Date(from);
     const end = new Date(to);
@@ -591,7 +778,6 @@ window.confirmReason = function (rid) {
     const field = rid ? byId(rid) : byId("reasonInput");
     const reason = field?.value?.trim() || "";
 
-    // Reason is optional — an empty reason is allowed (applied as N/A).
     if (pendingActionContext) {
         pendingActionContext.reason = reason;
         pendingActionContext.reason_asked = true;
@@ -636,7 +822,6 @@ window.selectLeaveForAction = async function (leaveGuid, action, button) {
 };
 
 async function sendActionWithContext(context) {
-    // carry any file the user chose (at the date or reason picker) into apply
     if (pendingAttachment && pendingAttachment.data) {
         context.attachment = pendingAttachment;
     }
@@ -647,7 +832,7 @@ async function sendActionWithContext(context) {
     const daysInfo = context.no_of_days ? ` | ${context.no_of_days} day${context.no_of_days === 1 ? "" : "s"}` : "";
     const dateInfo = fromDate ? " | " + fromDate + (toDate && toDate !== fromDate ? " -> " + toDate : "") : "";
 
-    appendMessage(makeMessage("user-message", leaveType + dateInfo + daysInfo + (reason ? " | " + reason : "")));
+    appendMessage(makeUserMessage(leaveType + dateInfo + daysInfo + (reason ? " | " + reason : "")));
 
     const botDiv = appendMessage(makeMessage("bot-message"));
     setThinking(botDiv);
@@ -705,7 +890,6 @@ window.downloadAttachment = function (filename, mimetype, b64) {
 };
 
 function attachmentButton(att) {
-    // returns a styled "download" button element, or null
     if (!att || !att.documentbody) return null;
     const b = document.createElement("button");
     b.type = "button";
@@ -800,7 +984,7 @@ window.answerConfirm = function (reply) {
 async function submitReplyWithConfirm(reply) {
     const ctx = pendingConfirm;
     pendingConfirm = null;
-    appendMessage(makeMessage("user-message", reply));
+    appendMessage(makeUserMessage(reply));
     const botDiv = appendMessage(makeMessage("bot-message"));
     setThinking(botDiv);
     try {
@@ -915,7 +1099,6 @@ function renderComparison(data) {
     const wrapper = makeMessage("bot-message");
     wrapper.style.display = "block";
 
-    // bounded card so nothing overflows the chat bubble
     const card = document.createElement("div");
     card.style.border = "1px solid rgba(16,24,40,0.10)";
     card.style.borderRadius = "12px";
@@ -937,7 +1120,6 @@ function renderComparison(data) {
     sub.textContent = data.metric + (data.period ? "  ·  " + data.period : "");
     card.appendChild(sub);
 
-    // --- responsive SVG bar chart (name on its own line; no clipping) ---
     const valued = items.filter((i) => i.value !== null && i.value !== undefined).map((i) => Number(i.value));
     const maxVal = Math.max(1, ...valued);
     const hiVal = valued.length ? Math.max(...valued) : null;
@@ -945,7 +1127,7 @@ function renderComparison(data) {
 
     const VBW = 480;
     const nameH = 17, barH = 20, gap = 16, padT = 4, valueW = 60;
-    const barMaxW = VBW - 4 - valueW;       // leave room for the value text
+    const barMaxW = VBW - 4 - valueW;
     const rowH = nameH + barH;
     const H = padT + items.length * (rowH + gap);
     const svgNS = "http://www.w3.org/2000/svg";
@@ -976,7 +1158,6 @@ function renderComparison(data) {
         const val = Number(it.value) || 0;
         const bw = isNull ? 0 : Math.max(3, (val / maxVal) * barMaxW);
 
-        // name line (full width, no clipping) + most/least tag
         let tag = "";
         if (!isNull && hiVal !== loVal && val === hiVal) tag = "  ·  most";
         else if (!isNull && hiVal !== loVal && val === loVal) tag = "  ·  least";
@@ -1017,7 +1198,6 @@ function renderComparison(data) {
         card.appendChild(sm);
     }
 
-    // --- export buttons (inside the card) ---
     const bar = document.createElement("div");
     bar.style.display = "flex";
     bar.style.flexWrap = "wrap";
@@ -1119,7 +1299,6 @@ function renderProfile(data) {
     card.style.padding = "14px";
     card.style.background = "rgba(255,255,255,0.65)";
 
-    // header: avatar (initials) + name
     const header = document.createElement("div");
     header.style.display = "flex";
     header.style.alignItems = "center";
@@ -1156,7 +1335,6 @@ function renderProfile(data) {
     header.appendChild(nameEl);
     card.appendChild(header);
 
-    // labelled fields grid
     const grid = document.createElement("div");
     grid.style.display = "grid";
     grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(150px, 1fr))";
@@ -1224,7 +1402,6 @@ function renderList(data) {
         c.style.padding = "10px 12px";
         c.style.background = "rgba(255,255,255,0.65)";
 
-        // header: index + primary  ......  badge
         const header = document.createElement("div");
         header.style.display = "flex";
         header.style.alignItems = "center";
@@ -1254,7 +1431,6 @@ function renderList(data) {
         }
         c.appendChild(header);
 
-        // labelled fields
         if (item.fields && item.fields.length) {
             const grid = document.createElement("div");
             grid.style.display = "flex";
@@ -1294,7 +1470,6 @@ function renderList(data) {
     moreBtn.addEventListener("click", renderMore);
     wrapper.appendChild(moreBtn);
 
-    // --- export (CSV + PNG) for the whole list ---
     const xbar = document.createElement("div");
     xbar.style.display = "flex";
     xbar.style.flexWrap = "wrap";
@@ -1318,7 +1493,7 @@ function renderList(data) {
     wrapper.appendChild(xbar);
 
     appendMessage(wrapper);
-    renderMore(); // first page
+    renderMore();
     unblockInput();
 }
 
@@ -1469,9 +1644,9 @@ async function sendMessage() {
         alert("User token missing. Please login again.");
         return;
     }
-    pendingAttachment = null;   // fresh conversation turn -> drop any stale file
+    pendingAttachment = null;
 
-    appendMessage(makeMessage("user-message", message));
+    appendMessage(makeUserMessage(message));
     input.value = "";
 
     const botDiv = appendMessage(makeMessage("bot-message"));
@@ -1490,8 +1665,6 @@ async function sendMessage() {
 
     setStreamingState(true);
 
-    // If a confirmation is pending, a typed reply (yes/no/haan/naa/anything)
-    // is sent WITH that context so the backend continues the same action.
     const confirmCtx = pendingConfirm;
     pendingConfirm = null;
     const requestBody = confirmCtx
@@ -1573,10 +1746,6 @@ async function sendMessage() {
 
         currentReader = null;
 
-        // Was this a genuine live token stream (Ollama free-text — many chunks
-        // spread over time)? If so it already "typed" live, so DON'T re-type it.
-        // A structured response arrives as a quick burst (1-2 chunks, ~instant)
-        // -> add the cosmetic typewriter so it looks like typing.
         const spread = streamStart ? (Date.now() - streamStart) : 0;
         const wasLiveStream = chunkCount > 3 || spread > 700;
         if (!wasLiveStream && fullText) {
@@ -1609,4 +1778,4 @@ document.addEventListener("DOMContentLoaded", () => {
             sendMessage();
         }
     });
-}); 
+});
