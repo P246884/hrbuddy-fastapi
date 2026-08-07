@@ -195,19 +195,27 @@ function appendMessage(el) {
 
 function blockInput() {
     isActionFlow = true;
-    byId("messageInput").disabled = true;
-    byId("inputBlocker").classList.add("active");
-    byId("voiceBtn").disabled = true;
-    byId("attachBtn").disabled = true;
+    const mi = byId("messageInput");
+    if (mi) mi.disabled = true;
+    const ib = byId("inputBlocker");
+    if (ib) ib.classList.add("active");
+    const vb = byId("voiceBtn");
+    if (vb) vb.disabled = true;
+    const ab = byId("attachBtn");
+    if (ab) ab.disabled = true;
 }
 
 function unblockInput() {
     isActionFlow = false;
-    byId("messageInput").disabled = false;
-    byId("inputBlocker").classList.remove("active");
-    byId("voiceBtn").disabled = false;
-    byId("attachBtn").disabled = false;
-    byId("messageInput").focus();
+    const mi = byId("messageInput");
+    if (mi) mi.disabled = false;
+    const ib = byId("inputBlocker");
+    if (ib) ib.classList.remove("active");
+    const vb = byId("voiceBtn");
+    if (vb) vb.disabled = false;
+    const ab = byId("attachBtn");
+    if (ab) ab.disabled = false;
+    if (mi) mi.focus();
 }
 
 window.cancelFlow = function () {
