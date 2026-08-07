@@ -51,7 +51,7 @@ button { border: 0; }
     flex-direction: column;
     overflow: hidden;
     background: rgba(255, 255, 255, 0.96);
-    border: 1px solid rgba(255, 255, 255, 0.78);
+    border: 0;
     border-radius: 20px;
     box-shadow: var(--shadow);
 }
@@ -62,12 +62,12 @@ button { border: 0; }
 .chat-header {
     position: relative;
     z-index: 2;
-    min-height: 76px;
+    /* min-height: 76px; */
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 16px 20px;
+    padding: 12px 20px;
     background: linear-gradient(135deg, #0f3567 0%, #2f6fed 100%);
     color: #fff;
     border-radius: 20px 20px 0 0;
@@ -83,8 +83,8 @@ button { border: 0; }
 
 .brand-mark {
     position: relative;
-  width: 55px;
-    height: 55px;
+  width: 45px;
+    height: 45px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -96,8 +96,8 @@ button { border: 0; }
 }
 
 .brand-logo {
-    width: 42px;
-    height: 42px;
+    width: 30px;
+    height: 30px;
     object-fit: contain;
     display: block;
 }
