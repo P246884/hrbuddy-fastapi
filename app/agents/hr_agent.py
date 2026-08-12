@@ -407,7 +407,15 @@ def process_message(
                                           is_org_pending_query, build_org_pending,
                                           is_dept_leave_query, build_dept_leave,
                                           is_group_balance_query, build_group_balance,
-                                          is_low_balance_query, build_low_balance)
+                                          is_low_balance_query, build_low_balance,
+                                          is_leave_reason_query, build_leave_reason)
+
+    # "Why was my leave on 13 July rejected?" / "reason for my leave on <date>".
+    # Checked FIRST — otherwise 'leave ... on <date>' trips the apply-leave
+    # action detector ("No leave types found").
+    if is_leave_reason_query(translated_message):
+        return build_leave_reason(translated_message, user, token), None
+
     if is_on_leave_query(translated_message):
         return build_on_leave(translated_message, user, token), None
 

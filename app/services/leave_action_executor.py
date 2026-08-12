@@ -90,6 +90,95 @@ def _working_days(from_date, to_date, token, user):
     return count
 
 
+# -------------------------------------------------------
+# BACKDATED / PAST-DATE LEAVE RULES  (config: app/config/leave_rules.py)
+# -------------------------------------------------------
+
+def _is_past_date(date_str):
+    """True if date_str (YYYY-MM-DD) is strictly before today (yesterday or
+    earlier). Today itself is NOT past."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return False
+    return d < datetime.now().date()
+
+
+def _past_cutoff_date():
+    """The earliest date a leave may start, per MAX_PAST_MONTHS. Returns a
+    date, or None when the limit is disabled."""
+    from app.config import leave_rules as _rules
+    months = getattr(_rules, "MAX_PAST_MONTHS", None)
+    if not months:
+        return None
+    today = datetime.now().date()
+    # subtract N calendar months (handle year/month rollover + short months)
+    m = today.month - months
+    y = today.year
+    while m <= 0:
+        m += 12
+        y -= 1
+    day = today.day
+    # clamp for months with fewer days (e.g. 31 Aug -> 30 June)
+    import calendar
+    last = calendar.monthrange(y, m)[1]
+    if day > last:
+        day = last
+    return datetime(y, m, day).date()
+
+
+def _check_backdated(from_date):
+    """(ok, message). Blocks a start date older than the configured window."""
+    from app.config import leave_rules as _rules
+    cutoff = _past_cutoff_date()
+    if not cutoff:
+        return True, ""
+    try:
+        fd = datetime.strptime(from_date, "%Y-%m-%d").date()
+    except Exception:
+        return True, ""
+    if fd < cutoff:
+        msg = getattr(_rules, "OLD_DATE_MESSAGE", "")
+        months = getattr(_rules, "MAX_PAST_MONTHS", 2)
+        return False, msg.format(months=months, date=cutoff.isoformat())
+    return True, ""
+
+
+def _check_past_type(from_date, leave_type_name):
+    """(ok, message). For a PAST start date, only the configured leave types
+    are allowed (default: Sick Leave)."""
+    from app.config import leave_rules as _rules
+    allowed = getattr(_rules, "PAST_ONLY_ALLOWED_TYPES", []) or []
+    if not allowed:
+        return True, ""
+    if not _is_past_date(from_date):
+        return True, ""
+    lt = (leave_type_name or "").lower()
+    for a in allowed:
+        if a.lower() in lt or lt in a.lower():
+            return True, ""
+    pretty = " or ".join(allowed)
+    msg = getattr(_rules, "PAST_TYPE_MESSAGE", "")
+    return False, msg.format(allowed=pretty)
+
+
+def _filter_types_for_date(options, from_date):
+    """Given the balance-based type-picker options and a start date, drop the
+    types not permitted for a PAST date. options are strings like
+    'Annual Leave (12.5 days)'. Returns the filtered list (unchanged for
+    today/future or when no restriction is configured)."""
+    from app.config import leave_rules as _rules
+    allowed = getattr(_rules, "PAST_ONLY_ALLOWED_TYPES", []) or []
+    if not allowed or not from_date or not _is_past_date(from_date):
+        return options
+    kept = []
+    for opt in options:
+        name = opt.split("(")[0].strip().lower()
+        if any(a.lower() in name or name in a.lower() for a in allowed):
+            kept.append(opt)
+    return kept
+
+
 def _check_date_validity(from_date, to_date, token, user):
     """A leave range is valid as long as it contains at least one working day.
     Weekends/holidays inside a multi-day range are simply not counted — they do
@@ -488,6 +577,10 @@ def narrow_employee_records(records, message):
 
 def extract_employee_name_for_action(message):
     msg = clean_text(message)
+    # Strip the reason clause first — anything after "reason"/"because"/"kyunki"
+    # is free text (e.g. "sick hu isliye") and must NOT be mined for a name.
+    msg = re.split(r"\b(?:reason|because|bcoz|bcz|kyunki|kyuki|kyonki|"
+                   r"cause|coz|due to)\b", msg, 1)[0].strip()
     skip = {
         "sick", "annual", "casual", "leave", "comp", "carry",
         # relative-date words (must never be read as a person's name)
@@ -507,6 +600,12 @@ def extract_employee_name_for_action(message):
         "city", "out", "office", "work", "home", "town", "station",
         "please", "kindly", "so", "as", "was", "were", "is", "am", "are",
         "the", "a", "an", "and", "because", "since", "today",
+        # generic date/relative words — "for other/another/next day" is a DATE
+        # reference, not a person's name
+        "other", "another", "next", "prev", "previous", "last", "some",
+        "day", "days", "date", "dates", "week", "weeks", "month", "months",
+        "year", "years", "any", "new", "different", "coming", "upcoming",
+        "future", "past", "later", "same", "current",
     }
 
     def _clean_name(name):
@@ -737,6 +836,12 @@ def handle_apply_leave(message, user, token, pending_context=None):
             if r.get("leave_type") and float(r.get("balance") or 0) > 0
         ]
 
+    # Past-date restriction: if the chosen start date is in the past, only the
+    # configured leave types (default: Sick Leave) may be applied — so the
+    # type picker shows only those. today/future are unaffected.
+    if from_date:
+        leave_options = _filter_types_for_date(leave_options, from_date)
+
     # Weekday-resolved date -> confirm with a PRE-FILLED date picker. The user
     # said e.g. "monday"; we show the actual resolved date so they confirm or
     # adjust (this/next week is ambiguous). Explicit dates ("22 june 2026") and
@@ -782,6 +887,16 @@ def handle_apply_leave(message, user, token, pending_context=None):
             message="Select dates for " + employee_display_name + "'s " + leave_type_name + " leave:",
             context=new_ctx
         ), new_ctx
+
+    # EARLY date-policy gate: as soon as we know the start date (and type),
+    # enforce the backdated window and past-date type rule — BEFORE asking for
+    # a reason, so an old/invalid date is rejected immediately.
+    ok_back, back_msg = _check_backdated(from_date)
+    if not ok_back:
+        return _error_response("\u274c " + back_msg), None
+    ok_type, type_msg = _check_past_type(from_date, leave_type_name)
+    if not ok_type:
+        return _error_response("\u274c " + type_msg), None
 
     if not reason and not context.get("reason_asked"):
         new_ctx = {
@@ -849,6 +964,18 @@ def handle_apply_leave(message, user, token, pending_context=None):
             "Insufficient " + leave_info["leave_type_name"] + " balance for " + employee_display_name + ".\n"
             "Available: " + str(balance) + " days | Requested: " + str(requested) + " working day(s)."
         ), None
+
+    # Backdated window: block a start date older than the configured limit
+    # (app/config/leave_rules.py -> MAX_PAST_MONTHS).
+    ok_back, back_msg = _check_backdated(from_date)
+    if not ok_back:
+        return _error_response("\u274c " + back_msg), None
+
+    # Past-date type rule: past start dates allow only the configured types
+    # (default: Sick Leave). Enforced on the backend too, not just the picker.
+    ok_type, type_msg = _check_past_type(from_date, leave_type_name)
+    if not ok_type:
+        return _error_response("\u274c " + type_msg), None
 
     # Weekend + Holiday check
     is_valid, date_error_msg = _check_date_validity(from_date, to_date, token, user)
@@ -999,23 +1126,62 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
         employee_guid = emp_records[0].get("employee_guid")
         employee_name = emp_records[0].get("employee_name")
 
-    query = build_dynamic_query(
-        entity_name="leave_history",
-        filters={"target": "employee", "employee_guid": employee_guid,
-                 "status": status_filter, "top": "50"},
-        current_user=user
-    )
-    result = execute_crm_query(crm_query=query, token=token, user=user)
+    # status_filter may be a single status ("requested") or a list of statuses
+    # (cancel accepts both "requested" and "approved"). Fetch each and merge,
+    # de-duplicating by leave_guid.
+    statuses = status_filter if isinstance(status_filter, (list, tuple)) else [status_filter]
+    leaves = []
+    _seen_guids = set()
+    for _st in statuses:
+        q = build_dynamic_query(
+            entity_name="leave_history",
+            filters={"target": "employee", "employee_guid": employee_guid,
+                     "status": _st, "top": "50"},
+            current_user=user
+        )
+        r = execute_crm_query(crm_query=q, token=token, user=user)
+        if r.get("success") and r.get("data"):
+            for lv in r["data"]:
+                g = lv.get("leave_guid", "")
+                if g and g in _seen_guids:
+                    continue
+                _seen_guids.add(g)
+                leaves.append(lv)
 
-    if not result.get("success") or not result.get("data"):
-        return _error_response("No " + status_filter + " leave requests found for "
+    # For CANCEL: you may only cancel a leave whose date is today or in the
+    # future — a leave whose end date has already passed can't be cancelled.
+    if action == "cancel_leave":
+        _today = datetime.now().date().isoformat()
+        future_leaves = []
+        for lv in leaves:
+            end = (str(lv.get("to_date", "")) or str(lv.get("from_date", "")))[:10]
+            if end and end >= _today:
+                future_leaves.append(lv)
+        leaves = future_leaves
+
+    if not leaves:
+        _label = "/".join(statuses)
+        if action == "cancel_leave":
+            return _error_response(
+                "No upcoming " + _label + " leave found for "
+                + str(employee_name) + " that can be cancelled. "
+                "(Past-dated leaves can't be cancelled.)"), None
+        return _error_response("No " + _label + " leave requests found for "
                                + str(employee_name) + "."), None
-
-    leaves = result["data"]
 
     action_label = ("Reject" if action == "reject_leave"
                     else "Approve" if action == "approve_leave" else "Cancel")
     _verb = action_label.lower()
+
+    # map int statuscode -> readable word for the picker label
+    _STATUS_LABEL = {1: "Requested", 100010001: "Approved",
+                     100010003: "Cancelled", 100010004: "Rejected"}
+
+    def _status_word(lv):
+        s = lv.get("status")
+        if isinstance(s, (int, float)):
+            return _STATUS_LABEL.get(int(s), "")
+        return str(s or "").title()
 
     def _opts(lvs):
         out = []
@@ -1024,7 +1190,9 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
             fd = str(lv.get("from_date", ""))[:10]
             td = str(lv.get("to_date", ""))[:10]
             days = lv.get("days", "")
-            out.append({"label": f"{lt} | {fd} \u2192 {td} ({days} days)",
+            sw = _status_word(lv)
+            status_part = (" | " + sw) if sw else ""
+            out.append({"label": f"{lt} | {fd} \u2192 {td} ({days} days){status_part}",
                         "leave_guid": lv.get("leave_guid", "")})
         return out
 
@@ -1186,7 +1354,11 @@ def handle_cancel_leave(message, user, token):
     leave_guid = _extract_leave_guid(message)
     if leave_guid:
         return _execute_leave_action_by_guid("cancel_leave", leave_guid, message, user, token)
-    return _fetch_recent_leaves_of_employee(message=message, token=token, user=user, action="cancel_leave", status_filter="requested")
+    # You can cancel a leave that is still PENDING (requested) or already
+    # APPROVED — both are cancellable as long as the leave date hasn't passed.
+    return _fetch_recent_leaves_of_employee(
+        message=message, token=token, user=user,
+        action="cancel_leave", status_filter=["requested", "approved"])
 
 
 def _extract_leave_guid(message):

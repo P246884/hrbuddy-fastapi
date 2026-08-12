@@ -1039,3 +1039,159 @@ def build_low_balance(message, user, token):
                   + ("person" if len(groups) == 1 else "people")),
         "groups": groups,
     })
+
+
+# ============================================================================
+# LEAVE REASON / "why was my leave rejected"  — reason lookup for one date
+# ----------------------------------------------------------------------------
+#   "Why was my leave on 13 July rejected?"
+#   "What was the reason for my leave on 20 july?"
+# Logic:
+#   * find the person's leave(s) whose range covers that date
+#   * if a REJECTED one exists  -> show bam_rejectionreason (or "no reason given")
+#   * else (requested/approved) -> show the applicant's own bam_leavereason
+#   * if no leave on that date   -> say so politely
+# Defaults to the current user; HR/manager may name a person (auth-gated).
+# ============================================================================
+
+def is_leave_reason_query(message):
+    """True for 'why was my leave rejected on <date>', 'reason for my leave on
+    <date>'. Needs a reason/why QUESTION + a leave word + a specific day.
+    Must NOT fire on an apply request that merely contains the word 'reason'
+    (e.g. 'apply sick leave ... reason fever')."""
+    m = clean_text(message)
+    # An apply/cancel/approve action is NOT a reason lookup — bail out.
+    if re.search(r"\b(apply|applying|applied|cancel|cancelling|approve|"
+                 r"approving|reject|rejecting|submit|take|book)\b", m):
+        # exception: "why was it rejected" uses 'rejected' as a question, not
+        # an action — allow only when a clear question cue is present.
+        if not re.search(r"\b(why|reason for|what.*reason|kyun|kyu)\b", m):
+            return False
+    day = _specific_day(message)
+    if not day:
+        return False
+    has_leave = "leave" in m or "leaves" in m
+    if not has_leave:
+        return False
+    # question framing: "why ...", "reason for ...", "what was the reason",
+    # "rejected?/declined?" — but NOT "reason <freetext>" (value-giving form).
+    is_why = bool(re.search(r"\bwhy\b", m)) or bool(re.search(r"\bkyun?\b", m))
+    is_reason_for = bool(re.search(r"\breason\s+(for|behind|of)\b", m))
+    is_status_q = bool(re.search(r"\b(rejected|rejection|declined|"
+                                 r"not approved|turned down)\b", m))
+    return is_why or is_reason_for or is_status_q
+
+
+def _covers(rec, day):
+    """Does a leave record's date range include `day` (YYYY-MM-DD)?"""
+    frm = (rec.get("from_date", "") or "")[:10]
+    to = (rec.get("to_date", "") or "")[:10] or frm
+    if not frm:
+        return False
+    return frm <= day <= to
+
+
+def build_leave_reason(message, user, token):
+    day = _specific_day(message)
+    if not day:
+        return ("Which date? e.g. \"why was my leave on 13 July rejected?\"")
+
+    # Resolve target: self by default; a named person only for HR/manager.
+    target_guid = user.get("user_guid", "")
+    target_name = "your"
+    names = extract_comparison_names(message)  # reuses name cleaner
+    # only treat as "other person" if HR/admin/manager AND a real name found
+    is_privileged = bool(user.get("is_hr") or user.get("is_admin")
+                         or user.get("is_manager"))
+    if is_privileged and names:
+        res = resolve_employee(employee_name=names[0], token=token, user=user)
+        recs = res.get("data", []) if res.get("success") else []
+        if recs:
+            g = recs[0].get("employee_guid")
+            if not can_read_entity(entity="leave_history", current_user=user,
+                                   target_employee=g, token=token):
+                return "You are not authorized to view that employee's leave."
+            target_guid = g
+            nm = recs[0].get("employee_name") or names[0]
+            target_name = (nm.title() if nm.isupper() else nm) + "'s"
+
+    if not target_guid:
+        return "I couldn't identify whose leave to look up."
+
+    # Pull recent leaves for the person and find the one covering that day.
+    q = build_dynamic_query(
+        entity_name="leave_history",
+        filters={"target": "employee", "employee_guid": target_guid,
+                 "top": "100"},
+        current_user=user)
+    data = execute_crm_query(crm_query=q, token=token, user=user)
+    recs = data.get("data", []) if data.get("success") else []
+
+    matches = [r for r in recs if _covers(r, day)]
+    if not matches:
+        return ("I couldn't find " + target_name + " leave on " + day
+                + ". There's no leave record for that date.")
+
+    label_for = {v: k for k, v in _STATUS.items()}
+
+    def _status_of(r):
+        s = r.get("status")
+        if isinstance(s, (int, float)):
+            return label_for.get(int(s), "")
+        return str(s or "").lower()
+
+    # What is the user actually asking about?
+    #   "why was it rejected" / "rejection reason"  -> the REJECTION reason
+    #   "leave reason" / "what reason did I give"    -> the APPLICANT's reason
+    _m = clean_text(message)
+    asks_rejection = bool(re.search(r"\b(reject|rejected|rejection|declined|"
+                                    r"decline|turned down|not approved|"
+                                    r"disapprov)\b", _m))
+
+    def _pick(status_wanted):
+        for r in matches:
+            if _status_of(r) == status_wanted:
+                return r
+        return None
+
+    if asks_rejection:
+        # user explicitly wants the rejection story -> prefer a rejected record
+        rec = _pick("rejected") or matches[0]
+    else:
+        # plain "leave reason" -> prefer the applicant's own applied/approved
+        # record; only fall back to a rejected one if nothing else exists.
+        rec = (_pick("requested") or _pick("approved") or _pick("cancelled")
+               or matches[0])
+
+    status = _status_of(rec)
+    lt = rec.get("leave_type") or "leave"
+    frm = (rec.get("from_date", "") or "")[:10]
+    to = (rec.get("to_date", "") or "")[:10] or frm
+    span = frm if frm == to else (frm + " to " + to)
+
+    poss = target_name  # "your" / "Purav's"
+    subj = "Your" if poss == "your" else poss
+
+    # ---- REJECTION path: only when the user asked about rejection ----
+    if asks_rejection and status == "rejected":
+        rr = (rec.get("rejection_reason") or "").strip()
+        if rr:
+            return (subj + " " + lt + " (" + span + ") was rejected.\n"
+                    "Rejection reason: " + rr)
+        return (subj + " " + lt + " (" + span + ") was rejected, but no "
+                "rejection reason was recorded. Please check with the "
+                "approving manager for details.")
+
+    # If they asked about rejection but this record isn't rejected, say so.
+    if asks_rejection and status != "rejected":
+        return (subj + " " + lt + " (" + span + ") is " + (status or "on record")
+                + ", not rejected. So there's no rejection reason for it.")
+
+    # ---- APPLICANT REASON path: plain "leave reason" ----
+    lr = (rec.get("leave_reason") or "").strip()
+    status_word = status or "on record"
+    if lr:
+        return (subj + " " + lt + " (" + span + ") is " + status_word + ".\n"
+                "Reason you gave: " + lr)
+    return (subj + " " + lt + " (" + span + ") is " + status_word + ", but no "
+            "reason was recorded for it.")

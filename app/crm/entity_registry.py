@@ -194,6 +194,12 @@ ENTITY_REGISTRY = {
             "manager":
                 "bam_manager",
 
+            "leave_reason":
+                "bam_leavereason",
+
+            "rejection_reason":
+                "bam_rejectionreason",
+
             "leave_guid":
                 "bam_leaveid"
         },
