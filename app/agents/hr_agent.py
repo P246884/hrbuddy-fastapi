@@ -416,6 +416,14 @@ def process_message(
     if is_leave_reason_query(translated_message):
         return build_leave_reason(translated_message, user, token), None
 
+    # Policy questions from the org's policy PDFs (+ downloadable source).
+    from app.services.policy_qa import (is_policy_query, build_policy_answer_stream,
+                                        is_policy_list_query, build_policy_list)
+    if is_policy_list_query(translated_message):
+        return build_policy_list(), None
+    if is_policy_query(translated_message):
+        return build_policy_answer_stream(translated_message), None
+
     if is_on_leave_query(translated_message):
         return build_on_leave(translated_message, user, token), None
 

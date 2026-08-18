@@ -295,7 +295,7 @@ def extract_decision(message: str):
 
     try:
         print("PROMPT LENGTH:", len(SYSTEM_PROMPT))
-        response = client.chat(
+        response = ollama.chat(
             model=INTENT_MODEL,
             format="json",
             keep_alive="30m",
@@ -330,7 +330,7 @@ def chat_response(message: str):
         # stream (and must NOT re-type it with the cosmetic typewriter).
         yield "\x1fLIVE\x1f"
         try:
-            stream = client.chat(
+            stream = ollama.chat(
                 model=CHAT_MODEL,
                 stream=True,
                 keep_alive="30m",

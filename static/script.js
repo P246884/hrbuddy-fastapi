@@ -462,6 +462,11 @@ async function typewriterRender(botDiv, text, getStopped) {
 
 function getStatusMessages(message) {
     const msg = message.toLowerCase();
+    // policy questions first — otherwise "leave policy" trips the leave status
+    if (msg.includes("policy") || msg.includes("policies")) {
+        return ["Searching policy documents...", "Reading the policy...",
+                "Preparing the answer..."];
+    }
     if (msg.includes("apply")) return STATUS_MESSAGES.apply;
     if (msg.includes("approve")) return STATUS_MESSAGES.approve;
     if (msg.includes("reject")) return STATUS_MESSAGES.reject;
@@ -1233,6 +1238,115 @@ function renderComparison(data) {
     scrollToBottom();
 }
 
+function renderPolicyList(data) {
+    const wrapper = makeMessage("bot-message");
+    wrapper.style.display = "block";
+
+    const kicker = document.createElement("span");
+    kicker.className = "message-kicker";
+    kicker.textContent = "ENZO";
+    wrapper.appendChild(kicker);
+
+    const head = document.createElement("div");
+    head.style.fontWeight = "500";
+    head.style.marginBottom = "12px";
+    head.textContent = data.intro || "Policy documents";
+    wrapper.appendChild(head);
+
+    const list = document.createElement("div");
+    list.style.display = "flex";
+    list.style.flexDirection = "column";
+    list.style.gap = "8px";
+
+    (data.policies || []).forEach((p) => {
+        const row = document.createElement("div");
+        row.style.cssText =
+            "display:flex;flex-direction:column;gap:8px;" +
+            "padding:11px 13px;border:1px solid rgba(16,24,40,0.10);border-radius:10px;" +
+            "background:rgba(255,255,255,0.65);";
+
+        const left = document.createElement("div");
+        left.style.cssText = "display:flex;align-items:center;gap:9px;";
+        const icon = document.createElement("span");
+        icon.textContent = "📄";
+        icon.style.cssText = "flex:none;font-size:16px;";
+        const name = document.createElement("span");
+        name.textContent = p.title;
+        name.title = p.title;   // tooltip shows full name on hover
+        name.style.cssText =
+            "font-size:13.5px;font-weight:600;color:inherit;line-height:1.35;";
+        left.appendChild(icon);
+        left.appendChild(name);
+        row.appendChild(left);
+
+        if (p.download_file) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = "⬇ Export PDF";
+            btn.title = "Download " + p.title;
+            btn.style.cssText =
+                "align-self:flex-start;display:inline-flex;align-items:center;gap:5px;" +
+                "padding:5px 12px;border-radius:8px;border:1px solid rgba(37,99,235,0.35);" +
+                "background:rgba(37,99,235,0.08);color:#2563eb;font-size:12.5px;" +
+                "font-weight:600;cursor:pointer;white-space:nowrap;";
+            btn.addEventListener("click", () => {
+                const a = document.createElement("a");
+                a.href = "/policy/download?file=" + encodeURIComponent(p.download_file);
+                a.download = p.download_file;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            });
+            row.appendChild(btn);
+        }
+        list.appendChild(row);
+    });
+    wrapper.appendChild(list);
+
+    if (data.hint) {
+        const hint = document.createElement("div");
+        hint.style.cssText = "font-size:12.5px;opacity:.6;margin-top:12px;";
+        hint.textContent = data.hint;
+        wrapper.appendChild(hint);
+    }
+
+    appendMessage(wrapper);
+    scrollToBottom();
+    unblockInput();
+}
+
+function renderPolicyAnswer(data) {
+    const wrapper = makeMessage("bot-message");
+    wrapper.style.display = "block";
+
+    const kicker = document.createElement("span");
+    kicker.className = "message-kicker";
+    kicker.textContent = "ENZO";
+    wrapper.appendChild(kicker);
+
+    const body = document.createElement("div");
+    body.innerHTML = renderMarkdown(data.answer || "");
+    wrapper.appendChild(body);
+
+    // "Download full policy PDF" button (reuses attachmentButton)
+    if (data.attachment && data.attachment.documentbody) {
+        const btn = attachmentButton({
+            filename: data.attachment.filename,
+            mimetype: data.attachment.mimetype || "application/pdf",
+            documentbody: data.attachment.documentbody
+        });
+        if (btn) {
+            btn.textContent = "\u2b07 Download " +
+                (data.source_title || data.attachment.title || "policy PDF");
+            wrapper.appendChild(btn);
+        }
+    }
+
+    appendMessage(wrapper);
+    scrollToBottom();
+    unblockInput();
+}
+
 function renderBalanceGroup(data) {
     const wrapper = makeMessage("bot-message");
     wrapper.style.display = "block";
@@ -1610,6 +1724,14 @@ function renderBotResponse(botDiv, data) {
                 botDiv.remove();
                 renderBalanceGroup(data);
                 break;
+            case "policy_answer":
+                botDiv.remove();
+                renderPolicyAnswer(data);
+                break;
+            case "policy_list":
+                botDiv.remove();
+                renderPolicyList(data);
+                break;
             case "comparison":
                 botDiv.remove();
                 renderComparison(data);
@@ -1653,6 +1775,8 @@ async function sendMessage() {
         return;
     }
     pendingAttachment = null;
+    window._policyMeta = null;
+    window._policyMetaDone = false;
 
     appendMessage(makeUserMessage(message));
     input.value = "";
@@ -1724,35 +1848,98 @@ async function sendMessage() {
 
             const chunk = decoder.decode(value, { stream: true });
             const cleanedChunk = chunk.replace(/\x1fLIVE\x1f/g, "");
-            if (!cleanedChunk.trim()) continue;
-            if (!chunk.trim()) continue;
+            if (!cleanedChunk) continue;
 
+            // First chunk that looks like a full JSON object (picker/list/etc.)
+            // -> render as a structured response and stop.
             if (firstChunk) {
-                clearInterval(statusInterval);
-                firstChunk = false;
-
-                try {
-                    const parsed = JSON.parse(chunk);
-                    if (parsed && parsed.type) {
-                        setStreamingState(false);
-                        currentReader = null;
-                        renderBotResponse(botDiv, parsed);
-                        scrollToBottom();
-                        return;
-                    }
-                } catch (err) {
-                    // Not JSON; continue rendering the stream as text.
+                const trimmed = cleanedChunk.trim();
+                if (trimmed.startsWith("{")) {
+                    try {
+                        const parsed = JSON.parse(trimmed);
+                        if (parsed && parsed.type) {
+                            clearInterval(statusInterval);
+                            firstChunk = false;
+                            setStreamingState(false);
+                            currentReader = null;
+                            renderBotResponse(botDiv, parsed);
+                            scrollToBottom();
+                            return;
+                        }
+                    } catch (err) { /* not JSON, treat as text */ }
                 }
+                firstChunk = false;
             }
 
             if (!streamStart) streamStart = Date.now();
             chunkCount++;
             fullText += cleanedChunk;
-            botDiv.innerHTML = renderMarkdown(fullText);
-            scrollToBottom();
+
+            // Policy answers stream a metadata marker as the first line:
+            //   __POLICY_META__{...json...}\n
+            // Extract it once (for the download button) and strip it from view.
+            if (!window._policyMetaDone && fullText.indexOf("__POLICY_META__") !== -1) {
+                const nl = fullText.indexOf("\n");
+                if (nl !== -1) {
+                    const markerLine = fullText.slice(0, nl);
+                    const jsonStr = markerLine.replace("__POLICY_META__", "").trim();
+                    try {
+                        window._policyMeta = JSON.parse(jsonStr);
+                    } catch (e) { /* ignore */ }
+                    window._policyMetaDone = true;
+                    fullText = fullText.slice(nl + 1);   // strip marker line
+                }
+            }
+
+            // Once we have real text, stop the "thinking" animation and render.
+            if (fullText.trim()) {
+                clearInterval(statusInterval);
+                botDiv.innerHTML = renderMarkdown(fullText);
+                scrollToBottom();
+            }
+        }
+
+        // Stream ended. Make sure the thinking animation is gone.
+        clearInterval(statusInterval);
+        // If nothing rendered (edge case), show a soft fallback instead of a
+        // stuck "thinking" bubble.
+        if (!fullText.trim() && !window._policyMeta) {
+            botDiv.innerHTML = renderMarkdown("Sorry, I couldn't find an answer for that.");
         }
 
         currentReader = null;
+
+        // If this was a policy answer, append the "Download policy PDF" button
+        // now that the text has finished streaming. The PDF is fetched from the
+        // /policy/download endpoint by filename — no base64 in the stream.
+        if (window._policyMeta) {
+            const meta = window._policyMeta;
+            if (meta.download_file) {
+                const btn = document.createElement("button");
+                btn.type = "button";
+                btn.textContent = "\u2b07 Download " +
+                    (meta.source_title || "policy PDF");
+                btn.title = "Download " + (meta.source_title || "policy");
+                btn.style.cssText =
+                    "margin-top:8px;display:inline-flex;align-items:center;gap:6px;" +
+                    "padding:6px 12px;border-radius:8px;border:1px solid rgba(37,99,235,0.35);" +
+                    "background:rgba(37,99,235,0.08);color:#2563eb;font-size:13px;" +
+                    "font-weight:600;cursor:pointer;";
+                btn.addEventListener("click", () => {
+                    const url = "/policy/download?file=" +
+                        encodeURIComponent(meta.download_file);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = meta.download_file;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                });
+                botDiv.appendChild(btn);
+            }
+            window._policyMeta = null;
+            window._policyMetaDone = false;
+        }
 
         const spread = streamStart ? (Date.now() - streamStart) : 0;
         const wasLiveStream = chunkCount > 3 || spread > 700;
