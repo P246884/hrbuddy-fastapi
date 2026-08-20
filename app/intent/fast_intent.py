@@ -520,6 +520,16 @@ NON_NAME_QUALIFIERS = {
     # employee-lookup keywords — never a person's name
     "id", "ids", "code", "codes", "employee", "emp", "staff", "number", "no",
     "designation", "department", "dept",
+    # leave-status / approval words — never a person's name
+    "approval", "approvals", "approve", "approved", "pending", "requested",
+    "rejected", "rejection", "cancelled", "cancellation", "reject", "cancel", "awaiting", "status", "approve", "approved",
+    "who", "whom", "whose", "kaun", "kon", "kis", "kiski", "kisne", "sabki",
+    "sabke", "sab", "everyone", "all", "team",
+    # leave TYPE words — never a person's name
+    "sick", "annual", "casual", "unpaid", "maternity", "paternity",
+    "comp", "off", "carry", "forward", "compoff", "leave", "leaves",
+    "balance", "yearly", "medical", "vacation", "privilege", "earned",
+    "compensatory", "lwp", "lop", "cl", "sl", "pl", "el", "cf",
 }
 
 
@@ -580,7 +590,7 @@ def extract_employee_name(message, entity, target):
     if target == "self":
         return ""
 
-    msg = clean_text(message)
+    msg = clean_text(_normalize_leave_synonyms(message))
 
     # Pattern 1: possessive "harshal's"  — but skip qualifier words
     match = re.search(r"(?<![a-zA-Z])([a-zA-Z]+)'s(?![a-zA-Z])", message, re.IGNORECASE)
@@ -670,7 +680,51 @@ ACTION_TRIGGER_WORDS = [
 ]
 
 
+# User can name a leave type many ways. Map each synonym to the CANONICAL word
+# the rest of the system understands. Applied before parsing so "yearly leave",
+# "medical leave", "carried over" all resolve correctly (and "yearly" never
+# becomes a fake employee name).
+_LEAVE_TYPE_SYNONYMS = {
+    # annual
+    "yearly": "annual", "annually": "annual", "year": "annual",
+    "vacation": "annual", "vacations": "annual", "pl": "annual",
+    "privilege": "annual", "privileged": "annual", "earned": "annual",
+    "el": "annual", "paid leave": "annual",
+    # sick
+    "medical": "sick", "sickness": "sick", "ill": "sick", "illness": "sick",
+    "health": "sick", "sl": "sick",
+    # casual
+    "cl": "casual", "personal": "casual",
+    # carry forward
+    "carried over": "carry forward", "carryover": "carry forward",
+    "carry-forward": "carry forward", "carryforward": "carry forward",
+    "cf": "carry forward", "carried forward": "carry forward",
+    # comp off
+    "compensatory": "comp off", "comp-off": "comp off", "compoff": "comp off",
+    "overtime off": "comp off",
+    # maternity / paternity
+    "maternal": "maternity", "paternal": "paternity",
+    # unpaid
+    "lwp": "unpaid", "leave without pay": "unpaid", "loss of pay": "unpaid",
+    "lop": "unpaid",
+}
+
+
+def _normalize_leave_synonyms(message: str) -> str:
+    """Replace leave-type synonyms with their canonical word so downstream
+    detection recognises them (e.g. 'yearly balance' -> 'annual balance')."""
+    if not message:
+        return message
+    out = message
+    # longest phrases first so "leave without pay" wins over "leave"
+    for syn in sorted(_LEAVE_TYPE_SYNONYMS, key=len, reverse=True):
+        out = re.sub(r"\b" + re.escape(syn) + r"\b",
+                     _LEAVE_TYPE_SYNONYMS[syn], out, flags=re.IGNORECASE)
+    return out
+
+
 def parse_fast_intent(message: str):
+    message = _normalize_leave_synonyms(message)
     msg = clean_text(message)
 
     first_word = msg.split()[0] if msg.split() else ""
@@ -765,10 +819,18 @@ def parse_fast_intent(message: str):
     # "who is approving / who approves / who will approve my leave", "who is my
     # approver", "who rejects my leave / who is my rejecter" -> the approver /
     # rejecter IS the user's manager.
-    if re.search(r"\bapprov|\bapprover\b|\breject|\brejecter\b", msg) and (
-        re.search(r"\bmy\b|\bmeri\b|\bmera\b|\bmere\b", msg)
-        or re.search(r"\bwho\b|\bkaun\b|\bkon\b", msg)
-    ) and not re.search(r"\b(of|for)\s+[a-z]+", msg):
+    # "who approves/rejects my leaves" -> the person = the user's manager.
+    # But NOT "show my rejected/approved leaves" (that's a leave LIST by
+    # status, handled below). So require an approver/rejecter NOUN or a "who"
+    # question, and bail if it's clearly a "<status> leaves" list request.
+    _is_status_list = re.search(r"\b(rejected|approved|pending|cancelled)\s+"
+                                r"leaves?\b", msg) or \
+        re.search(r"\bleaves?\b.*\b(rejected|approved|pending|cancelled)\b", msg)
+    if (re.search(r"\bapprover\b|\brejecter\b|who\s+(approv|reject)", msg)
+            or (re.search(r"\bapprov|\breject", msg)
+                and re.search(r"\bwho\b|\bkaun\b|\bkon\b", msg))) \
+            and not _is_status_list \
+            and not re.search(r"\b(of|for)\s+[a-z]+", msg):
         return {
             "entity": "employee", "operation": "read", "target": "self",
             "filters": _base_filters(attribute="manager"), "answer": "",
@@ -1147,7 +1209,7 @@ def parse_fast_intent(message: str):
     # filters the card to it and says "not available" if the user has no such
     # balance. Canonical map keeps typos/synonyms together.
     if entity == "leave":
-        _cm = clean_text(message)
+        _cm = clean_text(_normalize_leave_synonyms(message))
         _type_map = [
             ("comp off", ["comp off", "compoff", "comp-off", "compensatory"]),
             ("carry forward", ["carry forward", "carry-forward", "carryforward", "carry"]),
@@ -1155,6 +1217,7 @@ def parse_fast_intent(message: str):
             ("annual", ["annual"]),
             ("casual", ["casual"]),
             ("earned", ["earned"]),
+            ("unpaid", ["unpaid"]),
             ("maternity", ["maternity"]),
             ("paternity", ["paternity"]),
         ]

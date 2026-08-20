@@ -120,9 +120,16 @@ def build_dynamic_query(
 
         if status:
 
-            status_value = STATUS_MAPPING.get(
-                str(status).lower()
-            )
+            # Prefer this entity's OWN status_map (some entities, like
+            # compoff, use different codes for the same label than the
+            # global leave STATUS_MAPPING does).
+            _entity_status_map = entity.get("status_map") or {}
+            _label_to_code = {str(v).lower(): k for k, v in _entity_status_map.items()}
+            status_value = _label_to_code.get(str(status).lower())
+            if status_value is None:
+                status_value = STATUS_MAPPING.get(
+                    str(status).lower()
+                )
 
             if status_value is not None:
 

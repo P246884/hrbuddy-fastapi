@@ -231,6 +231,65 @@ ENTITY_REGISTRY = {
             100010001: "Approved",
             100010004: "Rejected",
             100010003: "Cancelled",
+            810100008: "Cancel Request",
+        }
+    },
+
+    # ----------------------------------------------------------------
+    # comp-off requests — real CRM entity: bam_compoff.
+    # A separate workflow from leave: user requests time-off in lieu of extra
+    # work; ONLY the employee's MANAGER can approve/reject (never HR directly,
+    # though HR can view). Approval carries a 90-day validity window
+    # (crc08_expirydate = request's bam_timefrom + 90 days) — expired requests
+    # can no longer be approved or availed.
+    # ----------------------------------------------------------------
+    "compoff": {
+        "aliases": [
+            "comp off request", "comp off requests", "compoff request",
+            "compoff requests", "comp-off request", "comp-off requests",
+            "comp off history", "compoff history",
+        ],
+        "crm_entity": "bam_compoff",
+        "is_master_entity": False,
+        "primary_field": "bam_compoffid",
+        "employee_lookup": "bam_employee",
+        "date_field": "createdon",
+        "date_filter_field": "bam_timefrom",
+        "status_field": "statuscode",
+        "fields": {
+            "from_date": "bam_timefrom",
+            "to_date": "bam_timeto",
+            "status": "statuscode",
+            "requested_days": "bam_totaldays",
+            "approved_days": "bam_approvedcompoffindays",
+            "manager": "bam_manager",
+            "designation": "bam_designation",
+            "project": "crc08_project",
+            "request_reason": "bam_requestreason",
+            "manager_reason": "bam_reason",
+            "expiry_date": "crc08_expirydate",
+            "employee_code": "bam_employeecode",
+            "compoff_guid": "bam_compoffid",
+            "name": "bam_name",
+        },
+        "formatter": "compoff",
+        "prompt_description": "comp-off (compensatory off) REQUESTS: apply/show/approve/reject comp off",
+        "routing_signals": ["comp off", "compoff", "comp-off"],
+        "block_signals": [],
+        # CONFIRMED from live CRM optionset (statuscode field on bam_compoff):
+        #   Active=1, Approved=810100000, Requested=810100001,
+        #   Cancelled=810100002, Draft=810100003, Availed=810100004,
+        #   Applied For Leave=810100005, Reject=810100006, Expired=810100007,
+        #   Inactive=2
+        "status_map": {
+            810100001: "Requested",
+            810100000: "Approved",
+            810100002: "Cancelled",
+            810100003: "Draft",
+            810100004: "Availed",
+            810100005: "Applied For Leave",
+            810100006: "Rejected",
+            810100007: "Expired",
         }
     },
 
@@ -350,7 +409,9 @@ STATUS_MAPPING = {
     "rejected": 100010004,
     "requested": 1,
     "cancelled": 100010003,
-    "canceled": 100010003
+    "canceled": 100010003,
+    "cancel_request": 810100008,
+    "cancel request": 810100008
 }
 
 # -------------------------------------------------------

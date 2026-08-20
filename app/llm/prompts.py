@@ -47,9 +47,37 @@ Rules:
 - Extract all meaningful filters.
 - If unrelated to HRMS, return empty entity and use answer field.
 
+SCOPE — who the data is about (VERY IMPORTANT, set target + scope filter):
+- "my ..." (my leaves, meri chhutti, my balance) → target="self". This is the
+  CURRENT USER's own data. Do NOT add manager/team filters.
+- "my team / meri team / my department / mere reportees / the people I manage /
+  jinke main manager hoon" → target="multiple", filters.scope="team". These are
+  the current user's DIRECT REPORTS.
+- "leaves pending my approval / leaves to approve / jo mujhe approve karni hain /
+  awaiting my approval / my approval queue" → target="multiple",
+  filters.scope="team", filters.status="requested". (The approver's team's
+  pending leaves.)
+- "all / across the org / organization / company-wide / everyone / sabki /
+  poori company" → target="multiple", filters.scope="org".
+- A person's name ("harshal's leaves") → target="employee",
+  filters.employee_name="harshal".
+- Bare "show rejected leaves" with no person/scope → target="multiple",
+  filters.scope="org" (or "team" if the user is a manager) + the status.
+
+- Combine scope WITH status naturally:
+  "meri team ki reject hui leaves" → target="multiple", scope="team",
+      status="rejected".
+  "show approved leaves across the org" → target="multiple", scope="org",
+      status="approved".
+  "kaun kaun ki leave pending hai" → target="multiple", scope="org",
+      status="requested".
+
 Filter keys allowed:
   employee_name   → single employee name
   employee_names  → list of names
+  scope           → "self" | "team" | "org"  (whose data: own / my direct
+                    reports / whole organization). Set this whenever the user
+                    talks about a group ("my team", "everyone", "all pending").
   status          → approved/rejected/requested/cancelled
   type            → leave type (sick/annual/casual etc)
   types           → list of types
@@ -91,6 +119,16 @@ modules need no new examples; just pick the right entity from the list above):
   → entity="leave_history", target="employee", filters={employee_name: "harshal", top: "5"}
 - "show approved leaves this month"
   → entity="leave_history", filters={status: "approved", months: "1"}
+- "show my rejected leaves" / "meri reject hui chhutti"
+  → entity="leave_history", target="self", filters={status: "rejected"}
+- "show rejected leaves of my team" / "meri team ki reject hui leaves"
+  → entity="leave_history", target="multiple", filters={scope: "team", status: "rejected"}
+- "leaves pending my approval" / "jo mujhe approve karni hain"
+  → entity="leave_history", target="multiple", filters={scope: "team", status: "requested"}
+- "show all pending leaves across the organization" / "poori company ki pending"
+  → entity="leave_history", target="multiple", filters={scope: "org", status: "requested"}
+- "who all took sick leave in project dept"
+  → entity="leave_history", target="multiple", filters={scope: "org", type: "sick", department: "project"}
 - "can i take 5 days leave" / "if i take 3 how many remain" / "meri 5 leave ho sakti hai"
   → entity="leave", operation="read", target="self"
   (ye feasibility hai — balance fetch karke jawab do, kitni bachegi bata do)

@@ -86,8 +86,8 @@ function renderGreeting(name) {
     greeting.innerHTML =
         SPARKLE_SVG +
         (safe
-            ? `Hi ${safe} 👋 Ask me anything about leave or employees.`
-            : `Hi 👋 Ask me anything about leave or employees.`);
+            ? `Hi ${safe} 👋 Ask me anything about leave.`
+            : `Hi 👋 Ask me anything about leave.`);
 }
 
 function setStatus(state, text) {
@@ -495,7 +495,11 @@ function renderTypePicker(data) {
         button.type = "button";
         button.className = "type-btn";
         button.textContent = option;
-        button.addEventListener("click", () => selectLeaveType(option, button));
+        if (data.context && data.context._awaiting_project) {
+            button.addEventListener("click", () => selectProjectOption(option, button));
+        } else {
+            button.addEventListener("click", () => selectLeaveType(option, button));
+        }
         options.appendChild(button);
     });
     wrapper.appendChild(options);
@@ -510,19 +514,13 @@ function renderDatePicker(data) {
     const pickerId = "dp_" + Date.now();
     const df = data.default_from || "";
     const dt = data.default_to || df;
+    // For approving/actioning an EXISTING comp-off (dates already in the
+    // past), bound the pickers to the request's own range instead of "today".
+    const minAttr = data.min_date || today;
+    const maxAttr = data.max_date || "";
+    const maxHtml = maxAttr ? ` max="${maxAttr}"` : "";
 
-    wrapper.innerHTML = `
-        <div class="action-title">${escapeHtml(data.message)}</div>
-        <div class="date-picker-row">
-            <div class="date-field">
-                <label for="fromDate_${pickerId}">Start date</label>
-                <input type="date" id="fromDate_${pickerId}" min="${today}" value="${df}">
-            </div>
-            <div class="date-field">
-                <label for="toDate_${pickerId}">End date</label>
-                <input type="date" id="toDate_${pickerId}" min="${today}" value="${dt}">
-            </div>
-        </div>
+    const halfDayHtml = data.hide_half_day ? "" : `
         <div class="halfday-row">
             <div class="halfday-toggle">
                 <input type="checkbox" id="halfDay_${pickerId}" onchange="toggleHalfDay('${pickerId}')">
@@ -544,9 +542,23 @@ function renderDatePicker(data) {
                     </div>
                 </div>
             </div>
+        </div>`;
+
+    wrapper.innerHTML = `
+        <div class="action-title">${escapeHtml(data.message)}</div>
+        <div class="date-picker-row">
+            <div class="date-field">
+                <label for="fromDate_${pickerId}">Start date</label>
+                <input type="date" id="fromDate_${pickerId}" min="${minAttr}"${maxHtml} value="${df}">
+            </div>
+            <div class="date-field">
+                <label for="toDate_${pickerId}">End date</label>
+                <input type="date" id="toDate_${pickerId}" min="${minAttr}"${maxHtml} value="${dt}">
+            </div>
         </div>
+        ${halfDayHtml}
         <div id="dateErr_${pickerId}" class="date-error">End date cannot be before start date.</div>
-        ${attachmentRowHTML(pickerId)}
+        ${data.hide_half_day ? "" : attachmentRowHTML(pickerId)}
         <button type="button" class="confirm-btn" onclick="confirmDates('${pickerId}')">Confirm dates</button>
     `;
 
@@ -575,8 +587,15 @@ window.selectEndHalf = function (pickerId, button) {
 function renderReasonPicker(data) {
     const wrapper = makeMessage("bot-message action-card");
     const rid = "reasonInput_" + Date.now();
+    // Attachment is only relevant when APPLYING a leave (medical cert etc).
+    // For reject/cancel/cancel-request/approve-cancel reasons, show only the
+    // text box — no file upload.
+    const ctx = data.context || {};
+    const isReasonSubmit = !!ctx._reason_submit;
     const alreadyAttached = !!(pendingAttachment && pendingAttachment.data);
-    const attachSection = alreadyAttached
+    let attachSection = "";
+    if (!isReasonSubmit) {
+        attachSection = alreadyAttached
         ? `<div class="attach-row" style="margin-top:14px;display:flex;align-items:center;gap:9px;
                   padding:10px 12px;border:1.5px solid #86efac;border-radius:12px;background:#f0fdf4;">
                <span style="flex:none;width:30px;height:30px;border-radius:8px;background:#dcfce7;
@@ -588,6 +607,7 @@ function renderReasonPicker(data) {
                </span>
            </div>`
         : attachmentRowHTML(rid);
+    }
     wrapper.innerHTML = `
         <div class="action-title">${escapeHtml(data.message)}</div>
         <div class="reason-row">
@@ -680,7 +700,7 @@ function renderLeavePicker(data) {
             button.type = "button";
             button.className = "leave-option-btn";
             button.textContent = leave.label;
-            button.addEventListener("click", () => selectLeaveForAction(leave.leave_guid, data.action, button));
+            button.addEventListener("click", () => selectLeaveForAction(leave.leave_guid || leave.compoff_guid, leave.action || data.action, button));
             list.appendChild(button);
         });
         shown += slice.length;
@@ -703,6 +723,19 @@ function renderLeavePicker(data) {
     pendingActionContext = { action: data.action, ...(data.context || {}) };
     blockInput();
 }
+
+window.selectProjectOption = function (projectName, button) {
+    document.querySelectorAll(".type-btn").forEach((btn) => btn.classList.remove("selected"));
+    button.classList.add("selected");
+    if (!pendingActionContext) return;
+    pendingActionContext = null;
+    unblockInput();
+    const input = byId("messageInput");
+    if (input) {
+        input.value = "apply comp off project " + projectName;
+        sendMessage();
+    }
+};
 
 window.selectLeaveType = function (option, button) {
     const leaveTypeName = option.split(" (")[0].trim();
@@ -771,6 +804,23 @@ window.confirmDates = function (pickerId) {
     }
 
     pendingActionContext.no_of_days = Math.max(totalDays, 0.5);
+
+    // Comp-off apply/approve have their OWN submit path (not the leave-apply
+    // flow) — no leave type, no half-day semantics needed there.
+    if (pendingActionContext.action === "apply_compoff" ||
+        pendingActionContext.action === "approve_compoff") {
+        const ctx = pendingActionContext;
+        // for approve_compoff, from_date/to_date represent the APPROVED range
+        // the manager picked (may be a subset of the original request).
+        if (ctx.action === "approve_compoff") {
+            ctx.approved_from = ctx.from_date;
+            ctx.approved_to = ctx.to_date;
+        }
+        pendingActionContext = null;
+        unblockInput();
+        sendReasonedAction(ctx, "");   // dates now in ctx; ask/submit continues server-side
+        return;
+    }
     sendActionWithContext(pendingActionContext);
 };
 
@@ -794,9 +844,52 @@ window.confirmReason = function (rid) {
     if (pendingActionContext) {
         pendingActionContext.reason = reason;
         pendingActionContext.reason_asked = true;
-        sendActionWithContext(pendingActionContext);
+        // reject/cancel/cancel-request/approve-cancel reason -> action path.
+        // compoff actions (apply/approve/reject) also route here even without
+        // a leave_guid (apply_compoff has none yet — it's a NEW record).
+        const isCompoffAction = ["apply_compoff", "approve_compoff", "reject_compoff"]
+            .includes(pendingActionContext.action);
+        if (pendingActionContext._reason_submit &&
+            pendingActionContext.action &&
+            (pendingActionContext.leave_guid || pendingActionContext.compoff_guid || isCompoffAction)) {
+            sendReasonedAction(pendingActionContext, reason);
+        } else {
+            sendActionWithContext(pendingActionContext);
+        }
     }
 };
+
+async function sendReasonedAction(context, reason) {
+    const botDiv = appendMessage(makeMessage("bot-message"));
+    setThinking(botDiv);
+    // (reason is sent to the server; no need to echo it as a chat bubble)
+    const guidPart = context.leave_guid || context.compoff_guid;
+    const msg = guidPart
+        ? (context.action + " " + guidPart + (reason ? " reason " + reason : ""))
+        : (reason || context.action);  // no guid yet (e.g. apply_compoff) — just
+                                        // send the typed text; the server reads
+                                        // the rest (project/dates/etc.) from context.
+    try {
+        const response = await fetch(CHAT_ENDPOINT, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + hrToken },
+            body: JSON.stringify({ message: msg, context })
+        });
+        if (isAuthError(response)) {
+            pendingActionContext = null; unblockInput(); botDiv.remove();
+            setUnauthorized(); return;
+        }
+        const data = await response.json();
+        pendingActionContext = null;
+        unblockInput();
+        renderBotResponse(botDiv, data);
+    } catch (err) {
+        pendingActionContext = null;
+        unblockInput();
+        botDiv.textContent = "Something went wrong. Please try again.";
+    }
+    scrollToBottom();
+}
 
 window.selectLeaveForAction = async function (leaveGuid, action, button) {
     if (button.disabled) return;
@@ -1494,7 +1587,9 @@ function renderList(data) {
         "approved":  ["#D1FADF", "#027A48"],
         "rejected":  ["#FEE4E2", "#B42318"],
         "cancelled": ["#EAECF0", "#475467"],
-        "canceled":  ["#EAECF0", "#475467"]
+        "canceled":  ["#EAECF0", "#475467"],
+        "cancel request": ["#DBEAFE", "#1E40AF"],
+        "cancel_request": ["#DBEAFE", "#1E40AF"]
     };
 
     const wrapper = makeMessage("bot-message");
@@ -1505,6 +1600,18 @@ function renderList(data) {
     head.style.marginBottom = "10px";
     head.textContent = data.intro || data.title || (items.length + " records");
     wrapper.appendChild(head);
+
+    // scope-clarity / summary line (e.g. "Showing pending leaves across the
+    // whole organization (you're HR)."). Rendered under the title.
+    if (data.summary) {
+        const sm = document.createElement("div");
+        sm.style.fontSize = "13px";
+        sm.style.opacity = ".7";
+        sm.style.marginTop = "-4px";
+        sm.style.marginBottom = "12px";
+        sm.textContent = data.summary;
+        wrapper.appendChild(sm);
+    }
 
     const listEl = document.createElement("div");
     listEl.style.display = "flex";
@@ -1694,6 +1801,14 @@ function tableToPng(title, cols, filename) {
 }
 
 function renderBotResponse(botDiv, data) {
+    // A structured response (picker/list/balance/holiday/etc.) is never a
+    // policy answer — clear any leftover policy download state so a stale
+    // "Download policy" button can't attach to it.
+    if (data && data.type && data.type !== "policy_answer" &&
+        data.type !== "policy_list") {
+        window._policyMeta = null;
+        window._policyMetaDone = false;
+    }
     if (data && data.type) {
         switch (data.type) {
             case "type_picker":

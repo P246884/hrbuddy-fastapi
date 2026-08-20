@@ -35,7 +35,7 @@ def call_hrbuddy_api(
                 f"{BASE_URL}{endpoint}",
                 headers=headers,
                 verify=False,
-                timeout=30
+                timeout=60
             )
 
         # -----------------------------------
@@ -48,7 +48,7 @@ def call_hrbuddy_api(
                 headers=headers,
                 json=body,
                 verify=False,
-                timeout=30
+                timeout=60
             )
 
         print(
@@ -70,7 +70,22 @@ def call_hrbuddy_api(
                     f"{response.status_code}"
             }
 
-        return response.json()
+        data = response.json()
+        # The .NET API returns {"rsponse": true, "responseText": "..."} (note
+        # the misspelled key). Normalize it to a "success"/"message" shape so
+        # all callers can rely on response.get("success").
+        if isinstance(data, dict) and "success" not in data:
+            _ok = data.get("rsponse")
+            if _ok is None:
+                _ok = data.get("Rsponse")
+            if _ok is None:
+                _ok = data.get("response")
+            if _ok is not None:
+                data["success"] = bool(_ok)
+            _txt = data.get("responseText") or data.get("ResponseText")
+            if _txt and "message" not in data:
+                data["message"] = _txt
+        return data
 
     except Exception as ex:
 

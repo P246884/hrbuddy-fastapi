@@ -606,6 +606,8 @@ def extract_employee_name_for_action(message):
         "day", "days", "date", "dates", "week", "weeks", "month", "months",
         "year", "years", "any", "new", "different", "coming", "upcoming",
         "future", "past", "later", "same", "current",
+        "approval", "approvals", "approve", "approved", "pending", "requested",
+        "rejected", "rejection", "cancelled", "cancellation", "awaiting", "status",
     }
 
     def _clean_name(name):
@@ -1091,11 +1093,83 @@ def _specific_date(message):
     return ""
 
 
+def _team_action_picker(message, user, token, action, status_filter):
+    """Build a single approve/reject picker containing the pending leaves of
+    ALL the manager's team members. Returns a picker response, or None if the
+    user has no team / no pending leaves (caller then falls back)."""
+    try:
+        from app.services.comparison import _employees_in_scope
+    except Exception:
+        return None
+
+    emps, _ = _employees_in_scope(user, token, force_team=True)
+    if not emps:
+        return None
+
+    _STATUS = {"requested": 1, "approved": 100010001,
+               "cancelled": 100010003, "rejected": 100010004,
+               "cancel_request": 810100008}
+    _LABEL = {1: "Requested", 100010001: "Approved",
+              100010003: "Cancelled", 100010004: "Rejected",
+              810100008: "Cancel Request"}
+    want = status_filter if isinstance(status_filter, (list, tuple)) else [status_filter]
+    want_codes = [_STATUS.get(s, 1) for s in want]
+
+    options = []
+    for e in emps:
+        g = e.get("employee_guid")
+        nm = e.get("employee_name", "")
+        if not g:
+            continue
+        for code in want_codes:
+            _slabel = _LABEL.get(code, "").lower().replace(" ", "_")
+            q = build_dynamic_query(
+                entity_name="leave_history",
+                filters={"target": "employee", "employee_guid": g,
+                         "status_code": code, "status": _slabel, "top": "50"},
+                current_user=user)
+            data = execute_crm_query(crm_query=q, token=token, user=user)
+            for lv in (data.get("data", []) if data.get("success") else []):
+                fd = str(lv.get("from_date", ""))[:10]
+                td = str(lv.get("to_date", ""))[:10] or fd
+                days = lv.get("days", "")
+                span = fd if fd == td else (fd + " \u2192 " + td)
+                sw = _LABEL.get(int(lv.get("status")) if isinstance(lv.get("status"), (int, float)) else 0, "")
+                label = (nm + " — " + str(lv.get("leave_type", "Leave"))
+                         + " | " + span + " (" + str(days) + " days)"
+                         + (" | " + sw if sw else ""))
+                options.append({"label": label,
+                                "leave_guid": lv.get("leave_guid", "")})
+
+    if not options:
+        return None
+
+    verb = ("approve" if action == "approve_leave"
+            else "reject" if action == "reject_leave"
+            else "approve cancellation of" if action == "approve_cancel"
+            else "cancel")
+    _pick_msg = ("Select a cancellation request to approve (your team):"
+                 if action == "approve_cancel"
+                 else "Select a leave to " + verb + " (your team):")
+    return _leave_picker_response(
+        _pick_msg,
+        options, action, {}), None
+
+
 def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter="requested"):
     emp_name = extract_employee_name_for_action(message)
     emp_code = extract_employee_code_for_action(message)
 
     if not emp_name and not emp_code:
+        # No employee named. For an APPROVE/REJECT action by a manager, this
+        # means "show me everything I can act on" -> gather the manager's whole
+        # TEAM's pending leaves into one picker (not the manager's own leaves).
+        if action in ("approve_leave", "reject_leave") and \
+                not (user.get("is_hr") or user.get("is_admin")):
+            team_picker = _team_action_picker(message, user, token, action,
+                                              status_filter)
+            if team_picker is not None:
+                return team_picker
         employee_guid = user.get("user_guid")
         employee_name = user.get("name", "You")
     else:
@@ -1175,7 +1249,8 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
 
     # map int statuscode -> readable word for the picker label
     _STATUS_LABEL = {1: "Requested", 100010001: "Approved",
-                     100010003: "Cancelled", 100010004: "Rejected"}
+                     100010003: "Cancelled", 100010004: "Rejected",
+              810100008: "Cancel Request"}
 
     def _status_word(lv):
         s = lv.get("status")
@@ -1192,8 +1267,18 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
             days = lv.get("days", "")
             sw = _status_word(lv)
             status_part = (" | " + sw) if sw else ""
-            out.append({"label": f"{lt} | {fd} \u2192 {td} ({days} days){status_part}",
-                        "leave_guid": lv.get("leave_guid", "")})
+            s = lv.get("status")
+            scode = int(s) if isinstance(s, (int, float)) else None
+            opt = {"label": f"{lt} | {fd} \u2192 {td} ({days} days){status_part}",
+                   "leave_guid": lv.get("leave_guid", ""),
+                   "status_code": scode}
+            # For a CANCEL picker: an APPROVED leave can't be cancelled outright,
+            # it must go through a cancellation REQUEST. Tag the per-item action
+            # so the frontend/handler picks the right one on selection.
+            if action == "cancel_leave":
+                opt["action"] = ("cancel_request" if scode == 100010001
+                                 else "cancel_leave")
+            out.append(opt)
         return out
 
     def _pretty(iso):
@@ -1217,8 +1302,16 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
             # exactly one leave on that date -> skip the picker, confirm directly
             lv = on_date[0]
             _lg = lv.get("leave_guid", "")
+            # If this is a CANCEL on an APPROVED leave, it must go through a
+            # cancellation REQUEST (manager approves) — not a direct cancel.
+            _eff_action = action
+            if action == "cancel_leave":
+                _s = lv.get("status")
+                _sc = int(_s) if isinstance(_s, (int, float)) else None
+                if _sc == 100010001:   # Approved
+                    _eff_action = "cancel_request"
             return _confirm_single_response(
-                action, _lg,
+                _eff_action, _lg,
                 lv.get("leave_type", "Leave"),
                 str(lv.get("from_date", ""))[:10],
                 str(lv.get("to_date", ""))[:10],
@@ -1286,6 +1379,27 @@ def _fetch_recent_leaves_of_employee(message, token, user, action, status_filter
 # -------------------------------------------------------
 
 def _execute_leave_action_by_guid(action, leave_guid, message, user, token):
+    # Reason is REQUIRED for these actions (stored in CRM). If we don't have a
+    # reason yet, show the reason picker first; it re-submits the same action
+    # with the reason attached via pending_context.
+    _REASON_ACTIONS = {"reject_leave", "cancel_leave", "cancel_request",
+                       "approve_cancel"}
+    if action in _REASON_ACTIONS:
+        _reason = extract_reason_from_message(message)
+        if not _reason:
+            _prompt = {
+                "reject_leave": "Please add a reason for rejecting this leave:",
+                "cancel_leave": "Please add a reason for cancelling this leave:",
+                "cancel_request": "Please add a reason for your cancellation "
+                                  "request:",
+                "approve_cancel": "Please add a comment for approving this "
+                                  "cancellation:",
+            }.get(action, "Please add a reason:")
+            return _reason_picker_response(
+                _prompt,
+                {"_reason_submit": True, "action": action,
+                 "leave_guid": leave_guid}), None
+
     if action == "approve_leave":
         response = call_hrbuddy_api(
             endpoint="/api/hrbuddy/execute-action",
@@ -1310,11 +1424,49 @@ def _execute_leave_action_by_guid(action, leave_guid, message, user, token):
         response = call_hrbuddy_api(
             endpoint="/api/hrbuddy/execute-action",
             token=token, user=user, method="POST",
-            body={"action": "cancel_leave", "payload": {"leave_guid": leave_guid}}
+            body={"action": "cancel_leave",
+                  "payload": {"leave_guid": leave_guid,
+                              "comments": extract_reason_from_message(message)}}
         )
         if not response.get("success"):
             return _error_response(response.get("message", "Failed to cancel.")), None
         return _success_response("\u2705 Leave cancelled and balance restored."), None
+
+    elif action == "cancel_request":
+        # User requesting cancellation of their OWN (usually approved) leave.
+        # Maps to the .NET CancelLeaveRequest -> sets status to Cancel Request
+        # and emails the manager. Balance is restored only after the manager
+        # approves the cancellation.
+        response = call_hrbuddy_api(
+            endpoint="/api/hrbuddy/execute-action",
+            token=token, user=user, method="POST",
+            body={"action": "cancel_request",
+                  "payload": {"leave_guid": leave_guid,
+                              "comments": extract_reason_from_message(message)}}
+        )
+        if not response.get("success"):
+            return _error_response(response.get("message",
+                                   "Failed to submit cancellation request.")), None
+        return _success_response(
+            "\u2705 Your cancellation request has been submitted to your "
+            "manager for approval. You'll be notified once it's actioned."), None
+
+    elif action == "approve_cancel":
+        # Manager approving a Cancel Request -> leave becomes Cancelled and the
+        # employee's balance for that leave type is restored.
+        response = call_hrbuddy_api(
+            endpoint="/api/hrbuddy/execute-action",
+            token=token, user=user, method="POST",
+            body={"action": "approve_cancel",
+                  "payload": {"leave_guid": leave_guid,
+                              "comments": extract_reason_from_message(message)}}
+        )
+        if not response.get("success"):
+            return _error_response(response.get("message",
+                                   "Failed to approve cancellation.")), None
+        return _success_response(
+            "\u2705 Cancellation approved. The leave is now cancelled and the "
+            "balance has been restored to the employee."), None
 
     return _error_response("Unknown action."), None
 
@@ -1322,6 +1474,19 @@ def _execute_leave_action_by_guid(action, leave_guid, message, user, token):
 # -------------------------------------------------------
 # HANDLERS
 # -------------------------------------------------------
+
+def _is_any_manager(user, token):
+    """True if the user manages ANYONE (has direct reports) — used for a
+    general 'approve leave' with no employee named. Reuses the CRM-based check
+    so a manager whose JWT lacks IsManager is still recognised."""
+    if user.get("is_manager"):
+        return True
+    try:
+        from app.services.comparison import _has_direct_reports
+        return _has_direct_reports(user, token)
+    except Exception:
+        return False
+
 
 def handle_approve_leave(message, user, token):
     leave_guid = _extract_leave_guid(message)
@@ -1333,7 +1498,12 @@ def handle_approve_leave(message, user, token):
     # No GUID — check auth then show picker
     is_hr_admin = user.get("is_hr") or user.get("is_admin")
     emp_name = extract_employee_name_for_action(message)
-    if not is_hr_admin and not _is_manager_of(emp_name, token, user):
+    # authorized if: HR/admin, OR manager of the named employee, OR (no name
+    # given) the user manages anyone at all.
+    authorized = (is_hr_admin
+                  or (emp_name and _is_manager_of(emp_name, token, user))
+                  or (not emp_name and _is_any_manager(user, token)))
+    if not authorized:
         return _error_response("You are not authorized to approve leaves."), None
     return _fetch_recent_leaves_of_employee(message=message, token=token, user=user, action="approve_leave")
 
@@ -1345,20 +1515,67 @@ def handle_reject_leave(message, user, token):
 
     is_hr_admin = user.get("is_hr") or user.get("is_admin")
     emp_name = extract_employee_name_for_action(message)
-    if not is_hr_admin and not _is_manager_of(emp_name, token, user):
+    authorized = (is_hr_admin
+                  or (emp_name and _is_manager_of(emp_name, token, user))
+                  or (not emp_name and _is_any_manager(user, token)))
+    if not authorized:
         return _error_response("You are not authorized to reject leaves."), None
     return _fetch_recent_leaves_of_employee(message=message, token=token, user=user, action="reject_leave")
+
+
+def handle_approve_cancel(message, user, token):
+    """Manager approving a team member's Cancel Request. Shows the team's
+    cancel-request leaves to pick from, then approves (→ Cancelled + balance
+    restored via the .NET workflow)."""
+    leave_guid = _extract_leave_guid(message)
+    if leave_guid:
+        return _execute_leave_action_by_guid("approve_cancel", leave_guid,
+                                             message, user, token)
+    is_hr_admin = user.get("is_hr") or user.get("is_admin")
+    if not (is_hr_admin or _is_any_manager(user, token)):
+        return _error_response("You are not authorized to approve "
+                               "cancellation requests."), None
+    # gather the team's CANCEL-REQUEST leaves into one picker
+    picker = _team_action_picker(message, user, token, "approve_cancel",
+                                 "cancel_request")
+    if picker is not None:
+        return picker
+    return _text_response("There are no cancellation requests from your team "
+                          "right now."), None
 
 
 def handle_cancel_leave(message, user, token):
     leave_guid = _extract_leave_guid(message)
     if leave_guid:
-        return _execute_leave_action_by_guid("cancel_leave", leave_guid, message, user, token)
-    # You can cancel a leave that is still PENDING (requested) or already
-    # APPROVED — both are cancellable as long as the leave date hasn't passed.
+        # A picked leave: if the user explicitly wants to cancel an APPROVED
+        # leave (or said "cancel request"), submit a cancellation REQUEST
+        # (manager must approve). A still-pending (requested) leave can be
+        # cancelled outright.
+        m = (message or "").lower()
+        wants_request = bool(re.search(r"\b(cancel request|cancellation|"
+                                       r"approved leave|request cancel)\b", m))
+        act = "cancel_request" if wants_request else "cancel_leave"
+        return _execute_leave_action_by_guid(act, leave_guid, message, user, token)
+
+    # No guid yet -> show the user's OWN cancellable leaves to pick from.
+    # requested (can cancel directly) + approved (goes to cancel-request).
     return _fetch_recent_leaves_of_employee(
         message=message, token=token, user=user,
         action="cancel_leave", status_filter=["requested", "approved"])
+
+
+def handle_cancel_request(message, user, token):
+    """User wants to cancel an already-APPROVED leave — this raises a Cancel
+    Request that the manager must approve (per the .NET workflow)."""
+    leave_guid = _extract_leave_guid(message)
+    if leave_guid:
+        return _execute_leave_action_by_guid("cancel_request", leave_guid,
+                                             message, user, token)
+    # show the user's own APPROVED leaves to pick (only approved can be
+    # cancel-requested; requested ones can just be cancelled).
+    return _fetch_recent_leaves_of_employee(
+        message=message, token=token, user=user,
+        action="cancel_request", status_filter=["approved"])
 
 
 def _extract_leave_guid(message):
@@ -1709,4 +1926,14 @@ def execute_leave_action(action, message, user, token, pending_context=None):
         return handle_reject_leave(message, user, token)
     elif action == "cancel_leave":
         return handle_cancel_leave(message, user, token)
+    elif action == "cancel_request":
+        return handle_cancel_request(message, user, token)
+    elif action == "approve_cancel":
+        return handle_approve_cancel(message, user, token)
+    elif action == "apply_compoff":
+        from app.services.compoff_executor import build_apply_compoff
+        return build_apply_compoff(message, user, token, pending_context)
+    elif action in ("approve_compoff", "reject_compoff"):
+        from app.services.compoff_executor import build_approve_reject_compoff
+        return build_approve_reject_compoff(message, user, token, action, pending_context)
     return _text_response("I could not understand what action to perform."), None

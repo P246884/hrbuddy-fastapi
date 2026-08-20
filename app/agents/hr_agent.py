@@ -73,6 +73,34 @@ def detect_action_intent(message: str):
     msg = clean_text(message)
     tokens = _action_tokens(msg)
 
+    # --- COMP-OFF workflow (separate from leave; manager-only approve) ---
+    if re.search(r"\bcomp[\s-]?off\b", msg):
+        from app.services.compoff_executor import (
+            is_apply_compoff_query, detect_compoff_action)
+        _ca = detect_compoff_action(message)
+        if _ca:
+            return _ca
+        if is_apply_compoff_query(message):
+            return "apply_compoff"
+
+    # --- CANCEL-REQUEST workflow (approved-leave cancellation) ---
+    # User asking to cancel their OWN approved leave -> raise a Cancel Request
+    # (manager must approve). Phrases: "cancel my approved leave", "cancel
+    # request", "request to cancel my leave", "want to cancel my approved leave".
+    _is_read = bool(re.search(r"\b(show|list|display|view|dikhao|batao)\b", msg))
+    if not _is_read:
+        # manager approving a cancellation request
+        if re.search(r"\bapprove\b.*\bcancel", msg) or \
+           re.search(r"\bcancel(?:lation)?\s+approv", msg) or \
+           re.search(r"\bapprove\s+cancel", msg):
+            return "approve_cancel"
+        # user requesting cancellation of an approved leave
+        if re.search(r"\bcancel\b.*\bapproved\b", msg) or \
+           re.search(r"\bapproved\b.*\bcancel\b", msg) or \
+           re.search(r"\bcancel\s+request\b", msg) or \
+           re.search(r"\brequest\b.*\bcancel", msg):
+            return "cancel_request"
+
     # Question guard: "who is approving / who approves / who will approve my
     # leave", "who is my approver/manager" is a QUESTION about the approver, not
     # a command to approve/apply. Let the read path answer it (-> manager).
@@ -408,7 +436,19 @@ def process_message(
                                           is_dept_leave_query, build_dept_leave,
                                           is_group_balance_query, build_group_balance,
                                           is_low_balance_query, build_low_balance,
-                                          is_leave_reason_query, build_leave_reason)
+                                          is_leave_reason_query, build_leave_reason,
+                                          is_team_roster_query, build_team_roster)
+
+    # "show my team" / "my team members" — the manager's direct-report roster.
+    if is_team_roster_query(translated_message):
+        return build_team_roster(translated_message, user, token), None
+
+    # Comp-off VIEW (list only — a separate workflow from regular leave).
+    # Must run before the action-verb detection so "show comp off requests"
+    # never gets mistaken for an approve/reject action.
+    from app.services.compoff_executor import is_view_compoff_query, build_view_compoff
+    if is_view_compoff_query(translated_message):
+        return build_view_compoff(translated_message, user, token), None
 
     # "Why was my leave on 13 July rejected?" / "reason for my leave on <date>".
     # Checked FIRST — otherwise 'leave ... on <date>' trips the apply-leave
@@ -416,12 +456,17 @@ def process_message(
     if is_leave_reason_query(translated_message):
         return build_leave_reason(translated_message, user, token), None
 
-    # Policy questions from the org's policy PDFs (+ downloadable source).
+    # Policy questions that EXPLICITLY say "policy"/"rule"/"handbook" are safe
+    # to route here early (e.g. "leave policy", "travel policy") — otherwise the
+    # apply-leave detector would grab "leave policy". Broader, keyword-free
+    # policy detection happens LATER (see end of STEP 0), only after leave
+    # actions, comparisons, pending, manager, etc. have had their turn.
     from app.services.policy_qa import (is_policy_query, build_policy_answer_stream,
-                                        is_policy_list_query, build_policy_list)
+                                        is_policy_list_query, build_policy_list,
+                                        is_explicit_policy_query)
     if is_policy_list_query(translated_message):
         return build_policy_list(), None
-    if is_policy_query(translated_message):
+    if is_explicit_policy_query(translated_message):
         return build_policy_answer_stream(translated_message), None
 
     if is_on_leave_query(translated_message):
@@ -495,6 +540,34 @@ def process_message(
         parse_bulk_actions, handle_bulk_action, confirm_bulk_response,
         _execute_leave_action_by_guid, _confirm_single_response
     )
+    if pending_context and pending_context.get("_reason_submit"):
+        from app.services.leave_action_executor import (
+            _execute_leave_action_by_guid, extract_reason_from_message)
+        _act = pending_context.get("action")
+        _reason = (pending_context.get("reason")
+                   or extract_reason_from_message(translated_message)
+                   or "").strip()
+
+        # Comp-off actions carry a compoff_guid (or none, for apply) — route
+        # through execute_leave_action so the compoff_executor handles them.
+        if _act in ("apply_compoff", "approve_compoff", "reject_compoff"):
+            _ctx = dict(pending_context)
+            if _ctx.pop("_awaiting_dates", False):
+                # The user just typed DATES (not a reason) in response to the
+                # date prompt — do NOT store this text as the reason. Pass the
+                # raw typed text through as the message so build_apply_compoff
+                # re-parses it for dates; the reason will be asked separately.
+                _ctx["_message_is_dates_only"] = True
+                return execute_leave_action(_act, translated_message, user, token,
+                                            pending_context=_ctx)
+            _ctx["reason"] = _reason
+            return execute_leave_action(_act, translated_message, user, token,
+                                        pending_context=_ctx)
+
+        _lg = pending_context.get("leave_guid", "")
+        _msg = _act + " " + _lg + (" reason " + _reason if _reason else "")
+        return _execute_leave_action_by_guid(_act, _lg, _msg, user, token)
+
     if pending_context and pending_context.get("_confirm"):
         verdict = _interpret_yes_no(translated_message)
         if verdict == "yes":
@@ -604,6 +677,18 @@ def process_message(
         ), None
 
     # ----------------------------------
+    # STEP 3b: POLICY CONTENT FALLBACK
+    # No structured handler matched. Before giving up, check if the question is
+    # actually answerable from the policy PDFs (e.g. "rewards for reference",
+    # "escalation matrix") — topics that live inside a document but aren't
+    # leave/employee data. This runs LAST so it never steals comparison,
+    # pending, manager, balance, apply, etc.
+    # ----------------------------------
+    from app.services.policy_qa import is_policy_content_query
+    if is_policy_content_query(translated_message):
+        return build_policy_answer_stream(translated_message), None
+
+    # ----------------------------------
     # STEP 4: HR query check
     # ----------------------------------
     if not looks_like_hr_query(translated_message):
@@ -660,6 +745,19 @@ def process_message(
 
     # Ollama ne read entity return kiya
     if decision and decision.get("entity"):
+        # If the LLM detected a TEAM/ORG-scoped leave query (e.g. "rejected
+        # leaves of my team", "approved leaves across the org"), route it
+        # through the tested scope-aware pending/status handler so the right
+        # employees + status are fetched. This is what makes free-form,
+        # natural-language scope queries work without new rules.
+        _f = decision.get("filters", {}) or {}
+        _scope = str(_f.get("scope", "")).lower()
+        if (decision.get("entity") == "leave_history"
+                and decision.get("target") == "multiple"
+                and _scope in ("team", "org")):
+            from app.services.comparison import build_org_pending
+            # hand the ORIGINAL message so the handler re-reads status/dept/etc.
+            return build_org_pending(translated_message, user, token), None
         if decision.get("entity") not in ("leave", "leave_history", "employee"):
             return _coming_soon(), None
         return execute(

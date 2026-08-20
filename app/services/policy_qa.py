@@ -31,19 +31,30 @@ _ASK_WORDS = ("what", "how", "when", "can i", "am i", "is there", "explain",
 
 
 def is_policy_list_query(message):
-    """'what policies do you have', 'list all policies', 'show policy documents'.
-    Must be about the SET of policies, not a specific policy question."""
+    """'what policies do you have', 'list all policies', 'apar policies',
+    'company policies', bare 'policies'. About the SET, not one policy."""
     m = (message or "").lower()
     if re.search(r"\b(apply|cancel|balance)\b", m):
         return False
-    # needs an explicit list verb AND the plural 'policies'/'documents'
-    has_list_verb = bool(re.search(r"\b(list|all|which|what|show|available)\b", m))
     has_plural = bool(re.search(r"\b(policies|documents)\b", m))
-    # "notice period policy" is singular+specific -> NOT a list query
+    if not has_plural:
+        return False
+    # a specific policy named with the singular word "policy" is NOT a list
     is_specific = bool(re.search(r"\b(notice|leave|wfh|travel|dress|attendance|"
-                                 r"maternity|paternity|probation|reimbursement)\s+"
+                                 r"maternity|paternity|probation|reimbursement|"
+                                 r"whistle|bribery|grievance|disciplinary|"
+                                 r"referral|separation|diversity|pip|health)\s+"
                                  r"policy\b", m))
-    return has_list_verb and has_plural and not is_specific
+    if is_specific:
+        return False
+    # plural "policies" with a list/scope verb OR on its own (e.g. "apar
+    # policies", "company policies", "policies") -> list them all.
+    has_list_verb = bool(re.search(r"\b(list|all|which|what|show|available|"
+                                   r"our|apar|company|org|organization|"
+                                   r"every|the)\b", m))
+    # bare "policies?" (very short) also counts as a list request
+    word_count = len(re.findall(r"[a-z]{3,}", m))
+    return has_list_verb or word_count <= 2
 
 
 # topic phrases that are policy questions even without the word "policy"
@@ -73,85 +84,71 @@ _POLICY_TOPICS = (
 )
 
 
-def is_policy_query(message):
-    """True when the message looks like a question about a company policy.
-    Kept conservative so it doesn't steal leave-action / balance queries."""
-    m = (message or "").lower()
-
-    # explicit action / personal-data queries are NOT policy questions
-    if re.search(r"\b(apply|cancel|approve|reject)\b", m):
-        if not re.search(r"\b(policy|policies|rule|rules|guideline|handbook|"
-                         r"sop|procedure)\b", m):
-            return False
-    # leave-status / roster queries ("who is on leave", "pending leaves",
-    # "leave balance/history") are handled by their own flows, not policy —
-    # unless the user explicitly says "policy"/"rule".
-    if re.search(r"\b(on leave|who is|whos|pending|balance|history|"
-                 r"my leave|leave today|leave status)\b", m):
-        if not re.search(r"\b(policy|policies|rule|rules)\b", m):
-            return False
-    # "my leave balance", "my leave history" -> personal data, not policy
-    if re.search(r"\bmy\b", m) and re.search(r"\b(balance|history|leaves?|"
-                                             r"profile)\b", m):
-        if not re.search(r"\b(policy|policies|rule|rules)\b", m):
-            return False
-
-    has_policy_word = any(w in m for w in _POLICY_WORDS)
-    if has_policy_word:
+def _is_personal_or_action(m):
+    """True if the message is a leave-action or personal-data query (NOT policy)
+    unless it explicitly says policy/rule. These belong to other handlers."""
+    if re.search(r"\b(policy|policies|rule|rules|guideline|handbook|sop|procedure)\b", m):
+        return False
+    if re.search(r"\b(apply|cancel|approve|reject|pending|compare|balance|"
+                 r"history|profile|manager|on leave|who is|whos|my leave|"
+                 r"leave today|leave status|salary|holiday|birthday|experience|"
+                 r"designation|department|team|employees?|staff|report|"
+                 r"count|how many|no leave|zero leave|0 leave|taken|took|"
+                 r"this month|last month|calendar)\b", m):
         return True
+    # a date reference ("1 january", "on 28 aug", "2026-01-01") -> not policy
+    if re.search(r"\b\d{1,2}\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+                 r"|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}"
+                 r"|\b20\d{2}-\d{2}-\d{2}\b", m):
+        return True
+    if re.search(r"\bmy\b", m):
+        return True
+    return False
 
-    # topic phrase + a question/entitlement framing.
-    # Topics come from TWO sources:
-    #   1. the hardcoded _POLICY_TOPICS list (common HR topics), and
-    #   2. words auto-derived from the actual policy PDF filenames — so any
-    #      new/renamed policy is recognised WITHOUT a code change.
+
+def _all_policy_topics():
     try:
-        auto_topics = policy_rag.policy_topic_words()
+        auto = policy_rag.policy_topic_words()
     except Exception:
-        auto_topics = set()
-    all_topics = set(_POLICY_TOPICS) | auto_topics
+        auto = set()
+    return set(_POLICY_TOPICS) | auto
 
-    has_topic = any(t in m for t in all_topics)
-    has_ask = bool(re.search(r"\b(what|how|when|can|am|is|are|do|does|which|"
-                             r"why|explain|tell|eligible|allowed|entitled|"
-                             r"many|get|apply for)\b", m))
-    if has_topic and has_ask:
+
+def is_explicit_policy_query(message):
+    """EARLY routing: fires only when the query clearly names a policy (word
+    'policy'/'rule'/'handbook', or a known multi-word policy phrase like
+    'whistle blower'). Safe to run before leave-action handlers."""
+    m = (message or "").lower()
+    if _is_personal_or_action(m):
+        return False
+    if re.search(r"\b(policy|policies|rule|rules|guideline|handbook|sop|procedure)\b", m):
         return True
-
-    # A full policy PHRASE (a two-word topic like "workplace health" or
-    # "whistle blower") named on its own is a policy lookup even without a
-    # question word — it clearly refers to a specific policy.
-    multiword_topics = [t for t in all_topics if " " in t]
-    if any(t in m for t in multiword_topics):
+    multiword = [t for t in _all_policy_topics() if " " in t]
+    if any(t in m for t in multiword):
         return True
-
-    # "download/export/show the <something> policy/document"
-    if re.search(r"\b(download|export|send|share|show|give)\b", m) and \
+    if re.search(r"\b(download|export|send|share)\b", m) and \
        re.search(r"\b(policy|policies|document|pdf|handbook)\b", m):
         return True
-
-    # CONTENT FALLBACK — the keyword lists can't name every term inside 15 PDFs
-    # ("rewards for reference", "per-diem", "escalation matrix"...). So if the
-    # question isn't a personal-data/action query and it STRONGLY matches the
-    # policy documents themselves, treat it as a policy question. This makes any
-    # topic that actually lives in a PDF answerable without a code change.
-    has_ask_word = bool(re.search(r"\b(what|how|when|can|am|is|are|do|does|"
-                                  r"which|why|explain|tell|list|reward|rewards|"
-                                  r"amount|eligible|allowed|entitled|many|much|"
-                                  r"get|process|procedure|rule|rules|steps?|"
-                                  r"matrix|level|criteria|limit|eligibility|"
-                                  r"details?|define|meaning|scope)\b", m))
-    # also allow a bare 2+ word phrase (no question word) to be content-checked,
-    # e.g. "escalation matrix", "rewards for reference" — a noun phrase that may
-    # name a policy section.
-    word_count = len(re.findall(r"[a-z]{3,}", m))
-    if has_ask_word or word_count >= 2:
-        try:
-            if policy_rag.query_matches_policies(message):
-                return True
-        except Exception:
-            pass
     return False
+
+
+def is_policy_content_query(message):
+    """LATE fallback (after every structured handler failed): the question may
+    be answerable from a policy PDF (e.g. 'rewards for reference'). Requires a
+    genuine content match so it never answers random chit-chat."""
+    m = (message or "").lower()
+    if _is_personal_or_action(m):
+        return False
+    if len(re.findall(r"[a-z]{3,}", m)) < 2:
+        return False
+    try:
+        return policy_rag.query_matches_policies(message)
+    except Exception:
+        return False
+
+
+def is_policy_query(message):
+    return is_explicit_policy_query(message) or is_policy_content_query(message)
 
 
 def _pdf_base64(path):

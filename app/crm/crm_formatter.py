@@ -25,6 +25,7 @@ STATUS_LABELS = {
     100010001: "✅ Approved",
     100010004: "❌ Rejected",
     100010003: "🚫 Cancelled",
+    810100008: "🔄 Cancel Request",
 }
 
 

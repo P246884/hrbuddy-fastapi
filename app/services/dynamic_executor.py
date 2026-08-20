@@ -951,6 +951,52 @@ def execute(
     )
     print("AFTER FILTER:", records)
 
+    # --- experience filter (gt/gte/lt/lte) applied locally on employee lists ---
+    if entity == "employee" and records:
+        def _expf(r):
+            try:
+                return float(r.get("experience"))
+            except (TypeError, ValueError):
+                return None
+        eg = filters.get("experience_gt")
+        ege = filters.get("experience_gte")
+        el = filters.get("experience_lt")
+        ele = filters.get("experience_lte")
+        def _keep(r):
+            v = _expf(r)
+            if v is None:
+                return False
+            if eg not in (None, "", []) and not (v > float(eg)):
+                return False
+            if ege not in (None, "", []) and not (v >= float(ege)):
+                return False
+            if el not in (None, "", []) and not (v < float(el)):
+                return False
+            if ele not in (None, "", []) and not (v <= float(ele)):
+                return False
+            return True
+        if any(x not in (None, "", []) for x in (eg, ege, el, ele)):
+            records = [r for r in records if _keep(r)]
+
+    # --- team-scope for a MANAGER asking about "my team / team members" ---
+    # A manager (or a user the CRM shows as having reports) who asks for a team
+    # list must NOT see the whole org. Keep only their direct reports.
+    if entity == "employee" and target == "multiple" and records:
+        _omsg = (decision.get("original_message", "") or "").lower()
+        _wants_team = bool(re.search(r"\b(my team|team member|team members|"
+                                     r"meri team|mere team|my reportees|"
+                                     r"my department)\b", _omsg))
+        _is_hr = bool(user.get("is_hr") or user.get("is_admin"))
+        if _wants_team and not _is_hr:
+            _uname = (user.get("name", "") or "").strip().lower()
+            _uguid = str(user.get("user_guid", "")).strip().lower()
+            def _reports_to_me(r):
+                mg = str(r.get("manager_guid", "")).strip().lower()
+                mn = (r.get("manager", "") or "").strip().lower()
+                return (_uguid and mg == _uguid) or (_uname and mn == _uname)
+            scoped = [r for r in records if _reports_to_me(r)]
+            records = scoped
+
     # If the user named a specific month ("...of July"), narrow leave_history
     # records to that month so "show my pending leaves of July" lists only
     # July's (and "how many ... in July" counts only July's).

@@ -381,6 +381,6 @@ def chat_response(message: str):
                "• \"Show my leave history\" / \"how many leaves did I take in June\"\n"
                "• \"Show my profile\" / \"what's my experience\"\n"
                "• \"Apply sick leave for tomorrow\"\n"
-               "• \"Compare Purav and Harshal leaves\"")
+               "• \"Compare (x) and (y) employee leaves\"")
 
     return _gen()

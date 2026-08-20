@@ -40,7 +40,72 @@ _STOP = NON_NAME_QUALIFIERS | _COMP_EXTRA_STOP
 
 # status codes (mirror entity_registry)
 _STATUS = {"requested": 1, "approved": 100010001,
-           "cancelled": 100010003, "rejected": 100010004}
+           "cancelled": 100010003, "rejected": 100010004,
+           "cancel_request": 810100008}
+
+
+def is_team_roster_query(message):
+    """'show my team', 'my team members', 'who is in my team', 'who reports to
+    me', 'list my reportees'. A manager wants the LIST of their direct reports
+    (not leaves/balance — just who they are)."""
+    m = clean_text(message)
+    # must NOT be about leave/balance/status/cancel-request etc (those have
+    # their own flows) — roster is ONLY "who is on my team".
+    if re.search(r"\b(leave|leaves|balance|pending|rejected|approved|"
+                 r"cancel|cancelled|cancellation|request|requests|requested|"
+                 r"chhutti|chutti|salary|attendance|status)\b", m):
+        return False
+    has_team = bool(re.search(r"\b(my team|team members?|my reportees?|"
+                              r"my reports|meri team|who reports to me|"
+                              r"who.s in my team|who is in my team)\b", m))
+    return has_team
+
+
+def build_team_roster(message, user, token):
+    """List the current user's direct reports (their team). Managers see their
+    team; HR sees the whole org (with a tip to filter by department)."""
+    scope = _actor_scope(user, token)
+    is_hr = bool(user.get("is_hr") or user.get("is_admin"))
+
+    if scope == "none":
+        return ("You don't have any team members reporting to you. If you're a "
+                "manager and this looks wrong, please check with HR.")
+
+    emps, _ = _employees_in_scope(user, token, force_team=not is_hr)
+    if not emps:
+        if not is_hr:
+            return "You don't have any team members reporting to you."
+        return "I couldn't load the employee list right now."
+
+    items = []
+    for e in emps[:200]:
+        nm = e.get("employee_name") or "Employee"
+        nm = nm.title() if isinstance(nm, str) and nm.isupper() else nm
+        fields = [["Dept", str(e.get("department") or "—")],
+                  ["Designation", str(e.get("designation") or "—")]]
+        exp = e.get("experience")
+        if exp not in (None, ""):
+            try:
+                fields.append(["Experience", str(float(exp)) + " yrs"])
+            except (TypeError, ValueError):
+                pass
+        code = e.get("employee_code")
+        if code:
+            fields.append(["Code", str(code)])
+        items.append({"primary": nm, "fields": fields})
+
+    who = "your team" if not is_hr else "the organization"
+    summary = ("You have " + str(len(items)) + " team member(s)."
+               if not is_hr else
+               "Showing all " + str(len(items)) + " employees (you're HR).")
+    return json.dumps({
+        "type": "list", "kind": "employee",
+        "intro": ("Your team" if not is_hr else "All employees") +
+                 " — " + str(len(items)) + " " +
+                 ("person" if len(items) == 1 else "people"),
+        "summary": summary,
+        "count": len(items), "page_size": 10, "items": items,
+    })
 
 
 def is_on_leave_query(message):
@@ -489,30 +554,93 @@ _DEPT_SKIP = {"the", "of", "in", "a", "an", "for", "this", "their", "all",
               "balance", "balances", "id", "code", "member"}
 
 
-def _actor_scope(user):
+# cache of "does this guid have direct reports" so we don't re-query the CRM
+# on every message in a session.
+_HAS_REPORTS_CACHE = {}
+
+
+def _has_direct_reports(user, token):
+    """True if at least one employee reports to this user (by manager_guid or
+    manager display-name). Used when the JWT doesn't carry IsManager — some
+    managers (e.g. SHASHANK) come through with IsManager missing, so we confirm
+    against the CRM instead of denying them."""
+    guid = str(user.get("user_guid", "")).strip().lower()
+    name = clean_text(user.get("name", ""))
+    cache_key = guid or name
+    if not cache_key:
+        return False
+    if cache_key in _HAS_REPORTS_CACHE:
+        return _HAS_REPORTS_CACHE[cache_key]
+
+    found = False
+    try:
+        # try a direct manager_guid filter first
+        q = build_dynamic_query(
+            entity_name="employee",
+            filters={"target": "multiple", "manager_guid": user.get("user_guid", "")},
+            current_user=user)
+        data = execute_crm_query(crm_query=q, token=token, user=user)
+        emps = data.get("data", []) if data.get("success") else []
+        # confirm client-side by guid or manager display-name
+        for e in emps:
+            mg = str(e.get("manager_guid", "")).strip().lower()
+            mn = clean_text(e.get("manager", ""))
+            if (guid and mg == guid) or (name and mn == name):
+                found = True
+                break
+        # if the guid filter returned nothing, fall back to scanning by name
+        if not found and name:
+            q2 = build_dynamic_query(
+                entity_name="employee",
+                filters={"target": "multiple"}, current_user=user)
+            d2 = execute_crm_query(crm_query=q2, token=token, user=user)
+            allemps = d2.get("data", []) if d2.get("success") else []
+            for e in allemps:
+                if clean_text(e.get("manager", "")) == name:
+                    found = True
+                    break
+    except Exception:
+        found = False
+
+    _HAS_REPORTS_CACHE[cache_key] = found
+    return found
+
+
+def _actor_scope(user, token=None):
     """Returns ('hr'|'manager'|'none'). HR/Admin see everything; a manager
-    sees their own team; anyone else is denied."""
+    sees their own team; anyone else is denied. If the token doesn't flag the
+    user as a manager, we optionally confirm via the CRM (direct reports)."""
     if user.get("is_hr") or user.get("is_admin"):
         return "hr"
     if user.get("is_manager"):
         return "manager"
+    # token didn't say manager — check the CRM for direct reports
+    if token is not None and _has_direct_reports(user, token):
+        return "manager"
     return "none"
 
 
-def _employees_in_scope(user, token, department=None, designation=None):
+def _employees_in_scope(user, token, department=None, designation=None,
+                        force_team=False):
     """Load the employee list this actor is allowed to see.
     HR/Admin: everyone (optionally filtered to one department/designation).
     Manager:  only direct reports (manager_guid == user's guid).
+
+    force_team=True: scope to the actor's OWN direct reports even if they are
+    HR — used for "leaves pending MY approval", which is about the people this
+    person approves, not the whole org.
 
     Returns (employees, matched):
       matched is True only when a department/designation was requested AND at
       least one employee actually matched. When a filter is requested but
       NOTHING matches, we return ([], False) — we do NOT fall back to the whole
       org (that would silently answer with the wrong group's data)."""
-    scope = _actor_scope(user)
+    scope = _actor_scope(user, token)
     filters = {"target": "multiple"}
 
-    if scope == "manager":
+    team_mode = force_team or scope == "manager"
+
+    if team_mode:
         mgr_guid = user.get("user_guid", "")
         if not mgr_guid:
             # No guid to scope by — refuse rather than risk returning the org.
@@ -528,12 +656,12 @@ def _employees_in_scope(user, token, department=None, designation=None):
     edata = execute_crm_query(crm_query=emp_q, token=token, user=user)
     emps = edata.get("data", []) if edata.get("success") else []
 
-    # Manager: enforce team membership CLIENT-SIDE too. If the CRM ignored the
+    # Team scope: enforce team membership CLIENT-SIDE too. If the CRM ignored the
     # bam_manager filter (or matched by something else), we still keep only the
     # people who actually report to this manager — by guid if the record
     # carries one, otherwise by the manager's display name. This prevents a
     # manager ever seeing the whole org.
-    if scope == "manager":
+    if team_mode:
         mgr_guid = str(user.get("user_guid", "")).lower()
         mgr_name = clean_text(user.get("name", ""))
         kept = []
@@ -636,35 +764,87 @@ def _dept_summary_line(dept_counts):
 
 # ---- ORG-WIDE PENDING -------------------------------------------------------
 
-def is_org_pending_query(message):
-    """'show all pending leave requests across the organization',
-    'pending leaves company-wide', 'who has pending leave requests',
-    'pending leaves in finance department'."""
+def _org_status_wanted(message):
+    """If the message names a leave STATUS to list org-wide, return
+    (status_code, label); else None. Covers pending/approved/rejected/
+    cancelled."""
     m = clean_text(message)
-    pending = bool(re.search(r"\b(pending|awaiting|unapproved|requested|"
-                             r"to approve|for approval|need approval)\b", m))
-    if not pending:
+    # "cancel request" / "cancellation request" / "pending cancellation" ->
+    # the Cancel Request queue (checked before plain "cancelled").
+    if re.search(r"\bcancel\s+request", m) or \
+       re.search(r"\bcancellation\s+request", m) or \
+       re.search(r"\bpending\s+cancel", m) or \
+       re.search(r"\brequests?\s+to\s+cancel\b", m):
+        return (_STATUS["cancel_request"], "cancel_request")
+    if re.search(r"\b(pending|awaiting|unapproved|requested|to approve|"
+                 r"for approval|need approval|approval|approvals)\b", m):
+        return (_STATUS["requested"], "requested")
+    if re.search(r"\b(rejected|rejection|declined|turned down|"
+                 r"not approved)\b", m):
+        return (_STATUS["rejected"], "rejected")
+    if re.search(r"\b(approved|accepted|sanctioned|granted)\b", m):
+        return (_STATUS["approved"], "approved")
+    if re.search(r"\b(cancelled|canceled|cancellation)\b", m):
+        return (_STATUS["cancelled"], "cancelled")
+    return None
+
+
+def is_org_pending_query(message):
+    """Org/team-wide leave list by STATUS — 'show all pending leaves', 'show
+    rejected leaves across the org', 'approved leaves in project dept', 'who
+    has pending requests', 'pending approval leaves' (approver queue)."""
+    m = clean_text(message)
+
+    # A bare action verb ("approve leaves", "reject the leave", "cancel leave")
+    # is an ACTION, not a list — let the action flow handle it. Only treat it
+    # as a list when the user clearly wants to SEE them (show/list/pending/
+    # rejected/etc. framing).
+    is_bare_action = bool(re.search(r"^\s*(approve|reject|cancel|sanction|"
+                                    r"grant|decline)\b", m)) and \
+        not re.search(r"\b(show|list|all|display|pending|which|who|view|"
+                      r"see|status)\b", m)
+    if is_bare_action:
         return False
-    # self-scoped ("my/mine") pending is handled elsewhere — not org-wide
-    if re.search(r"\b(my|mine|meri|mere|mera)\b", m):
+
+    status = _org_status_wanted(message)
+    # "my team", "my department", "my dept" => the actor's TEAM (not personal).
+    wants_my_team = bool(re.search(r"\bmy\s+(team|department|dept)\b", m)
+                         or re.search(r"\bteam'?s\b", m)
+                         or re.search(r"\bteam\s+(leaves?|members?)\b", m))
+    # a group/scope word means this is a team/org view even without a status
+    group_word = bool(re.search(r"\b(across|org|organization|organisation|"
+                                r"company|company-wide|companywide|everyone|"
+                                r"all employees|all staff|whole|entire|team|"
+                                r"department|dept|sabki|sabke)\b", m))
+    if not status and not group_word:
         return False
-    leave = "leave" in m or "leaves" in m
-    if not leave:
+    if re.search(r"\b(my|mine|meri|mere|mera)\b", m) and not wants_my_team \
+            and not group_word:
+        return False
+    # a cancel-request query ("cancel requests of my team") may not contain the
+    # word "leave" — allow it when the cancel-request status is detected.
+    _is_cancel_req = bool(status and status[1] == "cancel_request")
+    if "leave" not in m and "leaves" not in m and not _is_cancel_req:
         return False
     orgwide = bool(re.search(r"\b(across|org|organization|organisation|"
                              r"company|company-wide|companywide|everyone|"
                              r"all employees|all staff|whole|entire|team|"
                              r"department|dept)\b", m))
-    all_pending = bool(re.search(r"\ball .*pending", m))
-    # "who has/have pending ..." — plainly asking about other people
-    who_pending = bool(re.search(r"\bwho\s+(has|have|are|is)\b", m))
-    return orgwide or all_pending or who_pending
+    all_x = bool(re.search(r"\ball .*(pending|rejected|approved|cancelled)", m))
+    who_x = bool(re.search(r"\bwho\s+(has|have|are|is|all)\b", m)
+                 or re.search(r"\b(kaun|kon|kis|kiski|kisne|sabki|sabke)\b", m))
+    approval = bool(re.search(r"\b(approval|approvals|to approve|for approval|"
+                              r"need approval|awaiting approval|"
+                              r"pending approval)\b", m))
+    # a bare "show rejected/approved/pending leaves" is also an org list
+    bare_status_list = bool(re.search(r"\b(show|list|all|display|view|see)\b", m))
+    return orgwide or all_x or who_x or approval or bare_status_list
 
 
 def build_org_pending(message, user, token):
     """List every REQUESTED (pending) leave in scope, with a department
     summary first, then the detail list."""
-    scope = _actor_scope(user)
+    scope = _actor_scope(user, token)
     if scope == "none":
         return ("Viewing pending leave requests across the org is available to "
                 "HR or a manager (for their own team). You can still check your "
@@ -677,7 +857,37 @@ def build_org_pending(message, user, token):
         fr, to = compute_date_range(message)  # optional window; usually none
     department = _extract_department(message)
 
-    emps, dept_matched = _employees_in_scope(user, token, department=department)
+    # "leaves pending MY approval" -> the people I approve (my team), even if
+    # Scope decision:
+    #  - HR/Admin: they oversee the whole org, so "pending approval" shows the
+    #    ENTIRE organization (they can approve/see everyone).
+    #  - A (non-HR) manager: "pending approval" = only THEIR team's requests.
+    _m = clean_text(message)
+    wants_org = bool(re.search(r"\b(all|across|org|organization|organisation|"
+                               r"company|company-wide|companywide|everyone|"
+                               r"whole|entire)\b", _m))
+    # asking specifically about the APPROVAL queue (pending things to approve)
+    is_approval_query = bool(re.search(r"\b(approval|approvals|to approve|"
+                                       r"for approval|awaiting approval|"
+                                       r"pending approval)\b", _m))
+    # asking about MY TEAM's data (any status)
+    wants_my_team = bool(re.search(r"\bmy\s+(team|department|dept)\b", _m)
+                         or re.search(r"\bteam'?s?\b", _m)
+                         or is_approval_query)
+    is_hr = bool(user.get("is_hr") or user.get("is_admin"))
+    # scope to the actor's team only for non-HR people (managers). HR sees org.
+    force_team = wants_my_team and not wants_org and not is_hr
+    # only show the "pending your approval" wording for a real approval query
+    label_approval = is_approval_query and force_team
+
+    emps, dept_matched = _employees_in_scope(user, token, department=department,
+                                             force_team=force_team)
+
+    if force_team and not emps:
+        return ("You don't have any team members reporting to you, so there "
+                "are no leaves pending your approval. To see the whole "
+                "organization's pending leaves, ask \"show all pending leaves "
+                "across the organization\".")
     if department and not dept_matched:
         return ("I couldn't find a department called \"" + department.title()
                 + "\". Please check the name — e.g. \"pending leaves in Project "
@@ -688,25 +898,68 @@ def build_org_pending(message, user, token):
                     + " department.")
         return "I couldn't load the employee list right now."
 
+    _st = _org_status_wanted(message)
+    if _st:
+        _sc, _slabel = _st
+    else:
+        _sc, _slabel = None, ""   # no status word -> show ALL statuses
     items, dept_counts = _collect_leaves(
         emps, user, token,
-        status_code=_STATUS["requested"], status_label="requested",
+        status_code=_sc, status_label=_slabel,
         fr=fr, to=to)
 
-    who = ("your team" if scope == "manager"
+    # human word for the status being listed
+    _stword = {"requested": "pending", "rejected": "rejected",
+               "approved": "approved", "cancelled": "cancelled",
+               "cancel_request": "cancellation-requested",
+               "": ""}.get(_slabel, "pending")
+    _sw = (_stword + " ") if _stword else ""   # spaced prefix, blank when all
+
+    who = ("leaves pending your approval" if label_approval
+           else "your team" if force_team
+           else "your team" if scope == "manager"
            else (department.title() + " department") if department
            else "the organization")
 
     if not items:
-        return "✅ No pending leave requests in " + who + " right now."
+        if label_approval:
+            return ("✅ Nothing needs your approval right now — no one in your "
+                    "team has a pending (requested) leave.")
+        if force_team:
+            return ("✅ No " + _stword + " leaves in your team right now.")
+        if scope == "hr" and not department:
+            return ("✅ No " + _stword + " leaves anywhere in the organization "
+                    "right now.")
+        return "✅ No " + _stword + " leaves in " + who + " right now."
 
-    summary = ("There are " + str(len(items)) + " pending leave request(s) in "
-               + who + ".")
+    # Scope-clarity line — tells the user EXACTLY whose leaves these are.
+    if label_approval:
+        scope_note = "These are leaves awaiting your approval (your team only)."
+    elif force_team:
+        scope_note = ("Showing " + _sw + "leaves for your team "
+                      "(the people who report to you).")
+    elif scope == "hr" and not department:
+        scope_note = ("Showing " + _sw + "leaves across the whole "
+                      "organization (you're HR). Tip: a manager sees only "
+                      "their own team.")
+    elif department:
+        scope_note = ("Showing " + _sw + "leaves in the "
+                      + department.title() + " department.")
+    else:
+        scope_note = "Showing " + _sw + "leaves for your team."
+
+    if label_approval:
+        summary = ("You have " + str(len(items)) + " leave request(s) waiting "
+                   "for your approval. " + scope_note)
+    else:
+        summary = ("There are " + str(len(items)) + " " + (_stword or "total")
+                   + " leave(s). " + scope_note)
     dept_line = _dept_summary_line(dept_counts)
     if dept_line and not department:
         summary += " By department: " + dept_line + "."
 
-    intro = "Pending leave requests — " + who
+    intro = ("Leaves pending your approval" if label_approval
+             else (_stword.title()+" " if _stword else "") + "Leaves — " + who)
     if fr and to:
         intro += " (" + fr + " to " + to + ")"
 
@@ -737,7 +990,7 @@ def is_dept_leave_query(message):
 def build_dept_leave(message, user, token):
     """All leaves for a named department (any status by default; honour an
     explicit status word), grouped with a per-status summary."""
-    scope = _actor_scope(user)
+    scope = _actor_scope(user, token)
     if scope == "none":
         return ("Department leave data is available to HR or a manager "
                 "(for their own team).")
@@ -839,21 +1092,26 @@ def _extract_designation(message):
 
 
 def is_group_balance_query(message):
-    """True for 'leave balance for <department|designation> ...' — a balance
-    read scoped to a whole department or designation (not one person)."""
+    """True for 'leave balance of <department|designation|team|everyone> ...' —
+    a balance read scoped to a GROUP of people (not one named person)."""
     m = clean_text(message)
     if not re.search(r"\bbalance\b", m):
         return False
-    # must name a department or a designation
+    # a specific named person's balance is NOT a group query
+    # (handled by the normal balance flow)
     has_dept = bool(re.search(r"\b(department|dept)\b", m))
     has_desig = bool(re.search(r"\bdesignation\b", m))
-    return has_dept or has_desig
+    # group words: team, all employees/members/staff, everyone
+    has_group = bool(re.search(r"\b(team|team members?|all (employees?|members?|"
+                               r"staff)|everyone|sabki|sabke|whole team|"
+                               r"my team|entire team)\b", m))
+    return has_dept or has_desig or has_group
 
 
 def build_group_balance(message, user, token):
     """Per-employee leave balance for every person in a department or
     designation, returned as a 'balance_group'."""
-    scope = _actor_scope(user)
+    scope = _actor_scope(user, token)
     if scope == "none":
         return ("Group leave balances are available to HR or a manager "
                 "(for their own team). For one person try "
@@ -862,18 +1120,36 @@ def build_group_balance(message, user, token):
     department = _extract_department(message)
     designation = _extract_designation(message)
 
-    if not department and not designation:
-        return ("Which group? e.g. \"leave balance for Project department\" or "
-                "\"leave balance for designation Team Member\".")
+    _m = clean_text(message)
+    # "team members / my team / all employees / everyone" — no dept/designation,
+    # scope to the actor's TEAM (manager) or the whole ORG (HR).
+    wants_team = bool(re.search(r"\b(team|team members?|all (employees?|members?|"
+                                r"staff)|everyone|sabki|sabke|whole team|"
+                                r"my team|entire team)\b", _m))
+    is_hr = bool(user.get("is_hr") or user.get("is_admin"))
 
-    emps, matched = _employees_in_scope(user, token,
-                                        department=department,
-                                        designation=designation)
-    if not matched or not emps:
-        label = (department.title() + " department") if department \
-            else ("designation " + designation.title())
-        return ("I couldn't find anyone under " + label + ". "
-                "Please check the name.")
+    if not department and not designation and not wants_team:
+        return ("Which group? e.g. \"leave balance for Project department\", "
+                "\"leave balance for designation Team Member\", or "
+                "\"leave balance of my team\".")
+
+    if department or designation:
+        emps, matched = _employees_in_scope(user, token,
+                                            department=department,
+                                            designation=designation)
+        if not matched or not emps:
+            label = (department.title() + " department") if department \
+                else ("designation " + designation.title())
+            return ("I couldn't find anyone under " + label + ". "
+                    "Please check the name.")
+    else:
+        # team/all scope: managers -> own team; HR -> whole org
+        emps, _ = _employees_in_scope(user, token, force_team=not is_hr)
+        if not emps:
+            if not is_hr:
+                return ("You don't have any team members reporting to you, so "
+                        "there are no team balances to show.")
+            return "I couldn't load the employee list right now."
 
     # one balance lookup per employee -> grouped cards
     groups = []
@@ -906,8 +1182,10 @@ def build_group_balance(message, user, token):
     if not groups:
         return "No employees found for that group."
 
-    who = (department.title() + " department") if department \
-        else ("designation " + designation.title())
+    who = ((department.title() + " department") if department
+           else ("designation " + designation.title()) if designation
+           else "your team" if not is_hr
+           else "the organization")
     return json.dumps({
         "type": "balance_group",
         "intro": "Leave balance — " + who + " (" + str(len(groups)) + " people)",
@@ -972,7 +1250,7 @@ def is_low_balance_query(message):
 def build_low_balance(message, user, token):
     """List people (in the actor's scope) whose remaining balance is under the
     threshold, as a 'balance_group' showing only their low leave types."""
-    scope = _actor_scope(user)
+    scope = _actor_scope(user, token)
     if scope == "none":
         return ("Checking who's low on leave balance is available to a manager "
                 "(for their team) or HR. You can still ask \"what's my leave "

@@ -366,7 +366,9 @@ def _answer_with_llm(query, context_chunks):
     )
     prompt = (
         "You are an HR assistant. Answer the employee's question in 2-4 short "
-        "sentences using ONLY the policy excerpts below. Be direct. If the "
+        "sentences using ONLY the policy excerpts below. Focus strictly on what "
+        "was asked and IGNORE unrelated details in the excerpt (e.g. if asked "
+        "about leave, do not mention dress code or timings). Be direct. If the "
         "answer isn't in the excerpts, say you couldn't find it in the policy "
         "documents.\n\n"
         "POLICY EXCERPTS:\n" + context + "\n\n"
@@ -408,7 +410,9 @@ def _answer_with_llm_stream(query, context_chunks):
     )
     prompt = (
         "You are an HR assistant. Answer the employee's question in 2-4 short "
-        "sentences using ONLY the policy excerpts below. Be direct. If the "
+        "sentences using ONLY the policy excerpts below. Focus strictly on what "
+        "was asked and IGNORE unrelated details in the excerpt (e.g. if asked "
+        "about leave, do not mention dress code or timings). Be direct. If the "
         "answer isn't in the excerpts, say you couldn't find it in the policy "
         "documents.\n\n"
         "POLICY EXCERPTS:\n" + context + "\n\n"
